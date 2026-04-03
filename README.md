@@ -62,6 +62,8 @@ mcp-windbg --transport streamable-http --host 127.0.0.1 --port 8000
 ```
 Endpoint: `http://127.0.0.1:8000/mcp`
 
+The HTTP transport also enables binary dump uploads through `PUT /uploads/dumps/{session_id}` after calling `create_upload_session`.
+
 ### Command Line Options
 
 ```
@@ -128,6 +130,42 @@ Once configured, restart your MCP client and start debugging:
 Analyze the crash dump at C:\dumps\app.dmp
 ```
 
+### Upload Workflow
+
+Upload-based dump analysis is available when the server runs with `streamable-http`.
+
+The upload workflow is only available over the `streamable-http` transport.
+The `session_id` variants of `open_windbg_dump`, `run_windbg_cmd`, and `close_windbg_dump` are only exposed in that transport mode.
+
+1. Call `create_upload_session` with a supported dump file name such as `crash.dmp`, `crash.mdmp`, or `crash.hdmp`
+2. Read `upload_path` from the tool result and combine it with your MCP server base URL
+3. Upload the raw dump bytes with `PUT {server_base_url}{upload_path}`
+4. Reuse the uploaded dump with `open_windbg_dump(session_id=...)`
+5. Use `run_windbg_cmd(session_id=...)` for follow-up debugger commands when needed
+6. Call `close_windbg_dump(session_id=...)` when analysis is complete
+
+`create_upload_session` returns `upload_path`, which is the HTTP path exposed by this server for the binary `PUT` upload. Clients should combine it with the externally reachable server base URL.
+
+The server stores uploads under `WINDBG_UPLOAD_DIR` using a unique prefix plus the original file name, for example `abc123-crash.mdmp`.
+
+Upload session behavior:
+
+- A successful upload stays available until it expires or `close_windbg_dump(session_id=...)` is called.
+- Accessing an expired uploaded session fails and the server cleans up its temporary resources.
+- `close_windbg_dump(session_id=...)` is rejected while the session is uploading or being analyzed by `open_windbg_dump` / `run_windbg_cmd`.
+- Failed uploads delete the temporary dump and invalidate the `session_id` immediately. Clients must create a new upload session before retrying.
+
+### Upload Environment Variables
+
+These options are primarily relevant for the `streamable-http` transport:
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `WINDBG_UPLOAD_DIR` | Directory used for temporary uploaded dump storage | `%PROGRAMDATA%\mcp-windbg\uploads` or the system temp directory |
+| `WINDBG_MAX_UPLOAD_MB` | Maximum accepted upload size in megabytes | `100` |
+| `WINDBG_SESSION_TTL_SECONDS` | Time-to-live for inactive upload sessions | `1800` |
+| `WINDBG_MAX_ACTIVE_SESSIONS` | Maximum number of active upload sessions | `10` |
+
 ## MCP Compatibility
 
 This server implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), making it compatible with any MCP-enabled client:
@@ -143,6 +181,7 @@ The beauty of MCP is that you write the server once, and it works everywhere. Ch
 | [`close_windbg_dump`](https://github.com/svnscha/mcp-windbg/wiki/Tools#close_windbg_dump) | Cleanup dump sessions | Resource management |
 | [`open_windbg_remote`](https://github.com/svnscha/mcp-windbg/wiki/Tools#open_windbg_remote) | Connect to remote debugging | Live debugging sessions |
 | [`close_windbg_remote`](https://github.com/svnscha/mcp-windbg/wiki/Tools#close_windbg_remote) | Cleanup remote sessions | Resource management |
+| `create_upload_session` | Create a temporary upload session | Streamable HTTP-only dump upload workflow |
 | [`run_windbg_cmd`](https://github.com/svnscha/mcp-windbg/wiki/Tools#run_windbg_cmd) | Execute WinDbg commands | Custom analysis and investigation |
 | [`send_ctrl_break`](https://github.com/svnscha/mcp-windbg/wiki/Tools#send_ctrl_break) | Break into a running target | Interrupt execution during live debugging |
 

@@ -5,6 +5,20 @@ All notable changes to the MCP Server for WinDbg Crash Analysis project will be 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **HTTP Dump Upload Workflow**: Added upload sessions for `streamable-http` clients so crash dumps can be transferred with `PUT /uploads/dumps/{session_id}` and then analyzed via `open_windbg_dump(session_id=...)` or `run_windbg_cmd(session_id=...)`
+
+### Changed
+
+- **Upload Session Contract**: Renamed the upload session response field from `upload_url` to `upload_path` to reflect that the server returns the HTTP upload path exposed by the streamable HTTP server
+
+### Fixed
+
+- **Upload Session Cleanup**: Clean up failed upload sessions immediately, reject expired uploaded sessions on access, and allow expired stale uploading sessions to be reclaimed safely
+
 ## [0.13.0] - 2026-03-18
 
 ### Added

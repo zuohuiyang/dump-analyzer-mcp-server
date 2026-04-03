@@ -3,14 +3,11 @@ import subprocess
 import time
 import threading
 import os
-import sys
 from typing import Optional
 
-# Add the src directory to the Python path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-
-from mcp_windbg.cdb_session import CDBSession, CDBError, DEFAULT_CDB_PATHS
-from mcp_windbg.server import get_or_create_session, unload_session
+from mcp_windbg.cdb_session import CDBSession, CDBError
+from mcp_windbg.server import cleanup_sessions, get_or_create_session, session_registry, unload_session
+from mcp_windbg.tests.test_support import find_available_cdb
 
 
 class CDBServerProcess:
@@ -109,10 +106,7 @@ class CDBServerProcess:
 
     def _find_cdb_executable(self) -> Optional[str]:
         """Find the cdb.exe executable."""
-        for path in DEFAULT_CDB_PATHS:
-            if os.path.isfile(path):
-                return path
-        return None
+        return find_available_cdb()
 
     def _read_output(self):
         """Thread function to read CDB output."""
@@ -144,6 +138,12 @@ class CDBServerProcess:
 class TestRemoteDebugging:
     """Test cases for remote debugging functionality."""
 
+    @pytest.fixture(autouse=True)
+    def cleanup_remote_sessions(self):
+        cleanup_sessions()
+        yield
+        cleanup_sessions()
+
     def test_remote_debugging_workflow(self):
         """Test the complete remote debugging workflow."""
         server = CDBServerProcess(port=5005)
@@ -166,17 +166,16 @@ class TestRemoteDebugging:
                 # Sometimes the first command might timeout during connection establishment
                 print(f"First command failed (this might be expected): {e}")
 
-            # Test that session exists in active sessions
-            from mcp_windbg.server import active_sessions
+            # Test that session exists in the session registry
             session_id = f"remote:{connection_string}"
-            assert session_id in active_sessions, "Session not found in active sessions"
+            assert session_id in session_registry.cdb_sessions, "Session not found in session registry"
 
             # Test closing the remote connection
             success = unload_session(connection_string=connection_string)
             assert success, "Failed to unload remote session"
 
             # Verify session was removed
-            assert session_id not in active_sessions, "Session still exists after unloading"
+            assert session_id not in session_registry.cdb_sessions, "Session still exists after unloading"
 
         finally:
             # Clean up the server process

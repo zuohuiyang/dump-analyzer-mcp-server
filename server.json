@@ -73,6 +73,34 @@
           "format": "string",
           "isSecret": false,
           "name": "_NT_SYMBOL_PATH"
+        },
+        {
+          "description": "Directory used for temporary uploaded dump storage when using streamable-http upload sessions",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "WINDBG_UPLOAD_DIR"
+        },
+        {
+          "description": "Maximum upload size in megabytes for streamable-http dump uploads",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "WINDBG_MAX_UPLOAD_MB"
+        },
+        {
+          "description": "Time-to-live in seconds for inactive upload sessions",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "WINDBG_SESSION_TTL_SECONDS"
+        },
+        {
+          "description": "Maximum number of active upload sessions",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "WINDBG_MAX_ACTIVE_SESSIONS"
         }
       ]
     }

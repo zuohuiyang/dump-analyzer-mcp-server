@@ -117,6 +117,7 @@ class CDBSession:
 
         self.output_lines = []
         self.lock = threading.Lock()
+        self.command_lock = threading.Lock()
         self.ready_event = threading.Event()
         self.reader_thread = threading.Thread(target=self._read_output)
         self.reader_thread.daemon = True
@@ -138,6 +139,10 @@ class CDBSession:
         """Find the cdb.exe executable"""
         if custom_path and os.path.isfile(custom_path):
             return custom_path
+
+        env_path = os.getenv("CDB_PATH")
+        if env_path and os.path.isfile(env_path):
+            return env_path
 
         for path in DEFAULT_CDB_PATHS:
             if os.path.isfile(path):
@@ -173,15 +178,16 @@ class CDBSession:
 
     def _wait_for_prompt(self, timeout=None):
         """Wait for CDB to be ready for commands by sending a marker"""
-        try:
-            self.ready_event.clear()
-            self.process.stdin.write(f"{COMMAND_MARKER}\n")
-            self.process.stdin.flush()
+        with self.command_lock:
+            try:
+                self.ready_event.clear()
+                self.process.stdin.write(f"{COMMAND_MARKER}\n")
+                self.process.stdin.flush()
 
-            if not self.ready_event.wait(timeout=timeout or self.timeout):
-                raise CDBError(f"Timed out waiting for CDB prompt")
-        except IOError as e:
-            raise CDBError(f"Failed to communicate with CDB: {str(e)}")
+                if not self.ready_event.wait(timeout=timeout or self.timeout):
+                    raise CDBError(f"Timed out waiting for CDB prompt")
+            except IOError as e:
+                raise CDBError(f"Failed to communicate with CDB: {str(e)}")
 
     def send_command(self, command: str, timeout: Optional[int] = None) -> List[str]:
         """
@@ -200,25 +206,28 @@ class CDBSession:
         if not self.process:
             raise CDBError("CDB process is not running")
 
-        self.ready_event.clear()
-        with self.lock:
-            self.output_lines = []
+        # A single CDB process cannot safely handle interleaved commands from
+        # multiple threads because stdout/marker state is shared.
+        with self.command_lock:
+            self.ready_event.clear()
+            with self.lock:
+                self.output_lines = []
 
-        try:
-            # Send the command followed by our marker to detect completion
-            self.process.stdin.write(f"{command}\n{COMMAND_MARKER}\n")
-            self.process.stdin.flush()
-        except IOError as e:
-            raise CDBError(f"Failed to send command: {str(e)}")
+            try:
+                # Send the command followed by our marker to detect completion
+                self.process.stdin.write(f"{command}\n{COMMAND_MARKER}\n")
+                self.process.stdin.flush()
+            except IOError as e:
+                raise CDBError(f"Failed to send command: {str(e)}")
 
-        cmd_timeout = timeout or self.timeout
-        if not self.ready_event.wait(timeout=cmd_timeout):
-            raise CDBError(f"Command timed out after {cmd_timeout} seconds: {command}")
+            cmd_timeout = timeout or self.timeout
+            if not self.ready_event.wait(timeout=cmd_timeout):
+                raise CDBError(f"Command timed out after {cmd_timeout} seconds: {command}")
 
-        with self.lock:
-            result = self.output_lines.copy()
-            self.output_lines = []
-        return result
+            with self.lock:
+                result = self.output_lines.copy()
+                self.output_lines = []
+            return result
 
     def shutdown(self):
         """Clean up and terminate the CDB process"""
