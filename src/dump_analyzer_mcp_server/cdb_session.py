@@ -34,9 +34,9 @@ def _timestamped_print(message: str) -> None:
     print(f"[{timestamp}] {message}")
 
 
+class CDBError(Exception):
 
     """Custom exception for CDB-related errors"""
-    pass
 
 
 @dataclass
