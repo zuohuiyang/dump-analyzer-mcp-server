@@ -1,13 +1,11 @@
 import asyncio
 import atexit
-import copy
 import errno
 import json
 import logging
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -17,6 +15,16 @@ from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData, TextContent, Tool, INVALID_PARAMS, INTERNAL_ERROR
 from pydantic import BaseModel, Field, model_validator
 
+from .logging_utils import (
+    bind_context,
+    make_context,
+    sanitize_client_addr,
+    sanitize_command,
+    sanitize_exception_message,
+    sanitize_output_text,
+    sanitize_path,
+    sanitize_url,
+)
 from . import upload_sessions
 from .cdb_session import CDBError, CDBSession
 from .upload_sessions import UploadSessionStatus
@@ -62,35 +70,31 @@ _running_requests: dict[str, threading.Event] = {}
 _running_lock = threading.Lock()
 
 
-def configure_logging(level: int = logging.INFO) -> None:
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+def _request_id_from_ctx(ctx) -> str:
+    if ctx is None:
+        return "-"
+    request_id = getattr(ctx, "request_id", None)
+    if request_id is None:
+        return "-"
+    return str(request_id)
 
 
-def timestamped_print(message: str) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"[{timestamp}] {message}")
+def _request_context_meta(server: Server) -> dict[str, str]:
+    ctx = _try_get_request_context(server)
+    return make_context(request_id=_request_id_from_ctx(ctx))
 
 
-def build_uvicorn_log_config() -> dict:
-    from uvicorn.config import LOGGING_CONFIG
-
-    log_config = copy.deepcopy(LOGGING_CONFIG)
-    default_formatter = log_config.get("formatters", {}).get("default")
-    if isinstance(default_formatter, dict):
-        default_formatter["fmt"] = "%(asctime)s.%(msecs)03d %(levelprefix)s %(message)s"
-        default_formatter["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    access_formatter = log_config.get("formatters", {}).get("access")
-    if isinstance(access_formatter, dict):
-        access_formatter["fmt"] = (
-            '%(asctime)s.%(msecs)03d %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
-        )
-        access_formatter["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    return log_config
+def _client_addr_from_request(request) -> str:
+    client = getattr(request, "client", None)
+    if client is None:
+        return "-"
+    host = getattr(client, "host", None)
+    port = getattr(client, "port", None)
+    if host and port is not None:
+        return sanitize_client_addr(f"{host}:{port}")
+    if host:
+        return sanitize_client_addr(host)
+    return "-"
 
 
 class UploadWorkflowError(RuntimeError):
@@ -158,9 +162,18 @@ async def upload_session_cleanup_loop(interval_seconds: int = DEFAULT_UPLOAD_CLE
     safe_interval = max(1, interval_seconds)
     while True:
         try:
-            upload_sessions.cleanup_expired_upload_sessions()
+            removed = upload_sessions.cleanup_expired_upload_sessions()
+            if removed:
+                logger.info(
+                    "Expired upload sessions removed: %s",
+                    removed,
+                    extra=make_context(event="upload.cleanup_loop", outcome="success"),
+                )
         except Exception:
-            logger.exception("Unexpected error during upload session cleanup loop")
+            logger.exception(
+                "Unexpected error during upload session cleanup loop",
+                extra=make_context(event="upload.cleanup_loop", outcome="error"),
+            )
         await asyncio.sleep(safe_interval)
 
 
@@ -212,6 +225,11 @@ def create_upload_session(file_name: str, file_size: int) -> Dict[str, object]:
     try:
         payload = upload_sessions.create_upload_session(file_name, file_size)
     except upload_sessions.UploadSessionLimitError as exc:
+        logger.warning(
+            "Upload session rejected: %s",
+            sanitize_exception_message(str(exc)),
+            extra=make_context(event="upload.prepare", outcome="rejected"),
+        )
         raise UploadWorkflowError(
             code=UPLOAD_ERROR_TOO_MANY_SESSIONS,
             message=str(exc),
@@ -219,6 +237,11 @@ def create_upload_session(file_name: str, file_size: int) -> Dict[str, object]:
             http_status=409,
         ) from exc
     except ValueError as exc:
+        logger.warning(
+            "Upload session validation failed: %s",
+            sanitize_exception_message(str(exc)),
+            extra=make_context(event="upload.prepare", outcome="invalid"),
+        )
         raise UploadWorkflowError(
             code=UPLOAD_ERROR_INVALID_FORMAT,
             message=str(exc),
@@ -232,6 +255,15 @@ def create_upload_session(file_name: str, file_size: int) -> Dict[str, object]:
         if metadata is not None:
             upload_sessions.mark_upload_failed(metadata)
         raise
+    logger.info(
+        "Prepared upload session for %s",
+        sanitize_path(file_name),
+        extra=make_context(
+            event="upload.prepare",
+            outcome="success",
+            file_id=file_id,
+        ),
+    )
     return payload
 
 
@@ -343,20 +375,37 @@ async def serve_http(
         public_base_url_override=public_base_url_override,
     )
 
-    logger.info("Starting %s on %s:%s", SERVER_NAME, host, port)
-    timestamped_print(f"{SERVER_NAME} running on http://{host}:{port}")
-    timestamped_print(f"MCP endpoint: {public_base_url}/mcp")
-    timestamped_print(f"Upload base URL: {public_base_url}")
+    logger.info(
+        "Starting %s on %s:%s",
+        SERVER_NAME,
+        host,
+        port,
+        extra=make_context(event="server.start", outcome="starting"),
+    )
+    logger.info(
+        "Server configuration prepared: public_base_url=%s upload_dir=%s max_active_sessions=%s session_ttl_seconds=%s",
+        sanitize_url(public_base_url),
+        sanitize_path(upload_runtime_config.upload_dir),
+        upload_runtime_config.max_active_sessions,
+        upload_runtime_config.session_ttl_seconds,
+        extra=make_context(event="server.start", outcome="configured"),
+    )
 
     config = uvicorn.Config(
         app,
         host=host,
         port=port,
-        log_level="info" if verbose else "warning",
-        log_config=build_uvicorn_log_config(),
+        log_level="debug" if verbose else "info",
+        log_config=None,
     )
     server_instance = uvicorn.Server(config)
-    await server_instance.serve()
+    try:
+        await server_instance.serve()
+    finally:
+        logger.info(
+            "Server stopped",
+            extra=make_context(event="server.stop", outcome="completed"),
+        )
 
 
 def create_http_app(
@@ -396,11 +445,23 @@ def create_http_app(
 
     async def upload_dump(request: Request) -> JSONResponse:
         file_id = request.path_params["file_id"]
+        client_addr = _client_addr_from_request(request)
+        request_logger = bind_context(
+            logger,
+            event="upload.put",
+            file_id=file_id,
+            client_addr=client_addr,
+        )
         metadata, error_kind, error_message = upload_sessions.prepare_upload_session_for_upload(
             file_id, upload_runtime_config.session_ttl_seconds
         )
         if metadata is None:
             if error_kind in {"busy", "invalid_state"}:
+                request_logger.warning(
+                    "Upload rejected before start: %s",
+                    sanitize_exception_message(error_message),
+                    extra=make_context(outcome="invalid"),
+                )
                 return upload_error(
                     409,
                     UPLOAD_ERROR_INVALID_STATE,
@@ -408,6 +469,11 @@ def create_http_app(
                     remediation="Create a new upload session if the previous upload is stuck, or wait and retry.",
                     details={"file_id": file_id},
                 )
+            request_logger.warning(
+                "Upload target not found: %s",
+                sanitize_exception_message(error_message),
+                extra=make_context(outcome="missing"),
+            )
             return upload_error(
                 404,
                 UPLOAD_ERROR_SESSION_NOT_FOUND,
@@ -427,10 +493,24 @@ def create_http_app(
         ) -> JSONResponse:
             upload_sessions.mark_upload_failed(metadata)
             if log_unexpected:
-                logger.exception("Unexpected upload failure for file_id=%s", file_id)
+                request_logger.exception(
+                    "Unexpected upload failure",
+                    extra=make_context(outcome="error"),
+                )
+            else:
+                request_logger.warning(
+                    "%s",
+                    sanitize_exception_message(message),
+                    extra=make_context(outcome="failed"),
+                )
             return upload_error(status_code, code, message, remediation=remediation, details=details)
 
         try:
+            request_logger.info(
+                "Upload started for %s",
+                sanitize_path(metadata.original_file_name),
+                extra=make_context(outcome="started"),
+            )
             max_bytes = upload_runtime_config.max_upload_mb * 1024 * 1024
             expected_signatures = upload_sessions.get_expected_dump_signatures(metadata.original_file_name)
             total_size = await _stream_upload_to_file(
@@ -486,6 +566,10 @@ def create_http_app(
             )
         except asyncio.CancelledError:
             upload_sessions.mark_upload_failed(metadata)
+            request_logger.warning(
+                "Upload cancelled",
+                extra=make_context(outcome="cancelled"),
+            )
             raise
         except Exception:
             return fail_upload(
@@ -499,6 +583,11 @@ def create_http_app(
         finally:
             upload_sessions.release_upload_lock(metadata)
 
+        request_logger.info(
+            "Upload completed with %s bytes",
+            total_size,
+            extra=make_context(outcome="success"),
+        )
         return JSONResponse(
             status_code=201,
             content={"file_id": file_id, "status": UploadSessionStatus.UPLOADED.value, "size_bytes": total_size},
@@ -509,6 +598,10 @@ def create_http_app(
         cleanup_task = asyncio.create_task(upload_session_cleanup_loop(DEFAULT_UPLOAD_CLEANUP_INTERVAL_SECONDS))
         try:
             async with session_manager.run():
+                logger.info(
+                    "HTTP application lifespan started",
+                    extra=make_context(event="server.lifespan", outcome="started"),
+                )
                 yield
         finally:
             cleanup_task.cancel()
@@ -517,6 +610,10 @@ def create_http_app(
             except asyncio.CancelledError:
                 pass
             cleanup_sessions()
+            logger.info(
+                "HTTP application lifespan stopped",
+                extra=make_context(event="server.lifespan", outcome="stopped"),
+            )
 
     return Starlette(
         debug=verbose,
@@ -571,18 +668,45 @@ def _create_server(
 
     @server.call_tool()
     async def call_tool(name, arguments: dict) -> list[TextContent]:
+        base_context = _request_context_meta(server)
+        tool_logger = bind_context(
+            logger,
+            event="mcp.call_tool",
+            request_id=base_context["request_id"],
+        )
         try:
             if name == "prepare_dump_upload":
                 args = PrepareDumpUploadParams(**arguments)
                 payload = create_upload_session(args.file_name, args.file_size)
+                tool_logger.info(
+                    "Tool completed: %s",
+                    name,
+                    extra=make_context(
+                        event="mcp.call_tool",
+                        outcome="success",
+                        request_id=base_context["request_id"],
+                        file_id=str(payload["file_id"]),
+                    ),
+                )
                 return [TextContent(type="text", text=json.dumps(payload))]
 
             if name == "start_analysis_session":
                 args = StartAnalysisSessionParams(**arguments)
+                start_logger = bind_context(
+                    logger,
+                    event="analysis.start",
+                    request_id=base_context["request_id"],
+                    file_id=args.file_id,
+                )
                 metadata, error_message = upload_sessions.acquire_uploaded_file_for_analysis(
                     args.file_id, upload_runtime_config.session_ttl_seconds
                 )
                 if metadata is None:
+                    start_logger.warning(
+                        "Analysis start rejected: %s",
+                        sanitize_exception_message(error_message),
+                        extra=make_context(outcome="invalid"),
+                    )
                     raise McpError(
                         ErrorData(code=INVALID_PARAMS, message=f"{UPLOAD_ERROR_INVALID_STATE}: {error_message}")
                     )
@@ -591,6 +715,11 @@ def _create_server(
                     args.file_id, upload_runtime_config.session_ttl_seconds
                 )
                 if analysis is None:
+                    start_logger.warning(
+                        "Analysis session creation failed: %s",
+                        sanitize_exception_message(error_message),
+                        extra=make_context(outcome="invalid"),
+                    )
                     raise McpError(
                         ErrorData(code=INVALID_PARAMS, message=f"{UPLOAD_ERROR_INVALID_STATE}: {error_message}")
                     )
@@ -603,15 +732,42 @@ def _create_server(
                         symbols_path=symbols_path or DEFAULT_SYMBOL_PATH,
                         timeout=timeout,
                         verbose=verbose,
+                        log_context={
+                            "request_id": base_context["request_id"],
+                            "file_id": args.file_id,
+                            "session_id": analysis.session_id,
+                        },
                     ),
                 )
                 payload = {"session_id": analysis.session_id, "file_id": args.file_id, "status": "ready"}
+                start_logger.info(
+                    "Analysis session ready",
+                    extra=make_context(
+                        outcome="success",
+                        request_id=base_context["request_id"],
+                        file_id=args.file_id,
+                        session_id=analysis.session_id,
+                    ),
+                )
                 return [TextContent(type="text", text=json.dumps(payload))]
 
             if name == "execute_windbg_command":
                 args = ExecuteWindbgCommandParams(**arguments)
+                command_preview = sanitize_command(args.command)
+                command_logger = bind_context(
+                    logger,
+                    event="analysis.execute",
+                    request_id=base_context["request_id"],
+                    session_id=args.session_id,
+                    command_preview=command_preview,
+                )
                 blocked = _validate_dangerous_command(args.command)
                 if blocked:
+                    blocked_preview = f"<blocked:{blocked}>"
+                    command_logger.warning(
+                        "Dangerous command blocked by policy",
+                        extra=make_context(outcome="blocked", command_preview=blocked_preview),
+                    )
                     raise McpError(
                         ErrorData(
                             code=INVALID_PARAMS,
@@ -632,10 +788,16 @@ def _create_server(
                     args.session_id, upload_runtime_config.session_ttl_seconds
                 )
                 if analysis is None or metadata is None:
+                    command_logger.warning(
+                        "Analysis session acquisition failed: %s",
+                        sanitize_exception_message(error_message),
+                        extra=make_context(outcome="missing"),
+                    )
                     raise McpError(
                         ErrorData(code=INVALID_PARAMS, message=f"{UPLOAD_ERROR_SESSION_NOT_FOUND}: {error_message}")
                     )
 
+                request_id = base_context["request_id"]
                 try:
                     session = upload_sessions.get_or_create_cdb_session(
                         upload_sessions.build_upload_cdb_session_key(args.session_id),
@@ -645,18 +807,49 @@ def _create_server(
                             symbols_path=symbols_path or DEFAULT_SYMBOL_PATH,
                             timeout=timeout,
                             verbose=verbose,
+                            log_context={
+                                "request_id": base_context["request_id"],
+                                "file_id": metadata.file_id,
+                                "session_id": args.session_id,
+                            },
                         ),
                     )
                     ctx = _try_get_request_context(server)
-                    request_id = str(ctx.request_id) if ctx is not None else f"local-{int(time.time() * 1000)}"
+                    request_id = str(ctx.request_id) if ctx is not None else request_id
                     loop = asyncio.get_running_loop()
                     cancel_event = threading.Event()
                     with _running_lock:
                         _running_requests[request_id] = cancel_event
 
+                    command_logger.info(
+                        "Command execution queued",
+                        extra=make_context(
+                            outcome="queued",
+                            request_id=request_id,
+                            file_id=metadata.file_id,
+                            session_id=args.session_id,
+                            command_preview=command_preview,
+                        ),
+                    )
                     await _send_tool_progress("queued", f"Running command: {args.command}")
 
+                    first_output_logged = False
+
                     def on_output(line: str) -> None:
+                        nonlocal first_output_logged
+                        if not first_output_logged:
+                            first_output_logged = True
+                            command_logger.info(
+                                "First command output observed: %s",
+                                sanitize_output_text(line),
+                                extra=make_context(
+                                    outcome="streaming",
+                                    request_id=request_id,
+                                    file_id=metadata.file_id,
+                                    session_id=args.session_id,
+                                    command_preview=command_preview,
+                                ),
+                            )
                         if ctx is None:
                             return
                         fut = asyncio.run_coroutine_threadsafe(
@@ -690,6 +883,18 @@ def _create_server(
                         cancel_event,
                     )
                     await _send_tool_progress("completed", "Command completed")
+                    command_logger.info(
+                        "Command completed in %sms with %s output lines",
+                        result["execution_time_ms"],
+                        len(result["output_lines"]),
+                        extra=make_context(
+                            outcome="success",
+                            request_id=request_id,
+                            file_id=metadata.file_id,
+                            session_id=args.session_id,
+                            command_preview=command_preview,
+                        ),
+                    )
                     payload = {
                         "success": True,
                         "command": args.command,
@@ -705,20 +910,56 @@ def _create_server(
 
             if name == "close_analysis_session":
                 args = CloseAnalysisSessionParams(**arguments)
+                close_logger = bind_context(
+                    logger,
+                    event="analysis.close",
+                    request_id=base_context["request_id"],
+                    session_id=args.session_id,
+                )
                 payload, error_kind, error_message = upload_sessions.close_analysis_session(args.session_id)
                 if payload is None:
+                    close_logger.warning(
+                        "Close analysis session failed: %s",
+                        sanitize_exception_message(error_message),
+                        extra=make_context(outcome="missing"),
+                    )
                     raise McpError(ErrorData(code=INVALID_PARAMS, message=f"{error_kind}: {error_message}"))
+                close_logger.info(
+                    "Analysis session closed",
+                    extra=make_context(outcome="success"),
+                )
                 return [TextContent(type="text", text=json.dumps(payload))]
 
+            tool_logger.warning(
+                "Unknown tool requested: %s",
+                name,
+                extra=make_context(event="mcp.call_tool", outcome="invalid", request_id=base_context["request_id"]),
+            )
             raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Unknown tool: {name}"))
 
         except UploadWorkflowError as exc:
+            tool_logger.warning(
+                "Upload workflow error: %s",
+                sanitize_exception_message(exc.message),
+                extra=make_context(event="mcp.call_tool", outcome="invalid", request_id=base_context["request_id"]),
+            )
             raise McpError(ErrorData(code=INVALID_PARAMS, message=json.dumps({"error": exc.to_payload()}))) from exc
         except McpError:
             raise
         except CDBError as exc:
+            tool_logger.exception(
+                "CDB execution failed: %s",
+                sanitize_exception_message(str(exc)),
+                extra=make_context(event="mcp.call_tool", outcome="error", request_id=base_context["request_id"]),
+            )
             raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(exc))) from exc
         except Exception as exc:
+            tool_logger.exception(
+                "Unhandled tool execution error for %s: %s",
+                name,
+                sanitize_exception_message(str(exc)),
+                extra=make_context(event="mcp.call_tool", outcome="error", request_id=base_context["request_id"]),
+            )
             raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Error executing tool {name}: {exc}")) from exc
 
     @server.progress_notification()
@@ -733,6 +974,10 @@ def _create_server(
             event = _running_requests.get(str(request_id))
         if event:
             event.set()
+            logger.info(
+                "Cancellation requested for running command",
+                extra=make_context(event="analysis.cancel", outcome="requested", request_id=str(request_id)),
+            )
 
     server.notification_handlers[types.CancelledNotification] = _on_cancelled
     return server

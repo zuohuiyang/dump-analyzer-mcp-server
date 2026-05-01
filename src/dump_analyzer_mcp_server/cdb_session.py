@@ -1,3 +1,4 @@
+import logging
 import os
 import queue
 import signal
@@ -5,8 +6,11 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Callable, Optional
+
+from .logging_utils import bind_context, make_context, sanitize_command, sanitize_exception_message, sanitize_output_text, sanitize_path
+
+logger = logging.getLogger(__name__)
 
 COMMAND_MARKER_TEXT = "COMMAND_COMPLETED_MARKER"
 COMMAND_MARKER = f".echo {COMMAND_MARKER_TEXT}"
@@ -27,12 +31,6 @@ DEFAULT_CDB_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbX86.exe"),
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbARM64.exe")
 ]
-
-
-def _timestamped_print(message: str) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"[{timestamp}] {message}")
-
 
 class CDBError(Exception):
 
@@ -61,6 +59,7 @@ class CDBSession:
         symbols_path: Optional[str] = None,
         timeout: int = 10,
         verbose: bool = False,
+        log_context: Optional[dict[str, str]] = None,
     ):
         """
         Initialize a dump-backed CDB debugging session.
@@ -85,10 +84,22 @@ class CDBSession:
         self.dump_path = dump_path
         self.timeout = timeout
         self.verbose = verbose
+        self.log_context = dict(log_context or {})
+        self.logger = bind_context(
+            logger,
+            event="cdb.session",
+            request_id=self.log_context.get("request_id"),
+            file_id=self.log_context.get("file_id"),
+            session_id=self.log_context.get("session_id"),
+        )
 
         # Find cdb executable
         self.cdb_path = self._find_cdb_executable(cdb_path)
         if not self.cdb_path:
+            self.logger.error(
+                "Could not resolve cdb executable",
+                extra=make_context(outcome="missing"),
+            )
             raise CDBError("Could not find cdb.exe. Please provide a valid path.")
 
         # Prepare command args
@@ -115,7 +126,20 @@ class CDBSession:
                 creationflags=creationflags,
             )
         except Exception as e:
+            self.logger.exception(
+                "Failed to start CDB process: %s",
+                sanitize_exception_message(str(e)),
+                extra=make_context(outcome="error"),
+            )
             raise CDBError(f"Failed to start CDB process: {str(e)}")
+
+        self.logger.info(
+            "Started CDB process for dump=%s cdb=%s symbols=%s",
+            sanitize_path(self.dump_path),
+            sanitize_path(self.cdb_path),
+            sanitize_path(symbols_path),
+            extra=make_context(outcome="started"),
+        )
 
         self.command_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -131,7 +155,26 @@ class CDBSession:
         time.sleep(0.2)
         if self.process.poll() is not None:
             self.shutdown()
+            self.logger.error(
+                "CDB process exited during initialization",
+                extra=make_context(outcome="error"),
+            )
             raise CDBError("CDB process exited during initialization")
+
+    def _ensure_logger(self):
+        current = getattr(self, "logger", None)
+        if current is not None:
+            return current
+        log_context = getattr(self, "log_context", {}) or {}
+        current = bind_context(
+            logger,
+            event="cdb.session",
+            request_id=log_context.get("request_id"),
+            file_id=log_context.get("file_id"),
+            session_id=log_context.get("session_id"),
+        )
+        self.logger = current
+        return current
 
     def _find_cdb_executable(self, custom_path: Optional[str] = None) -> Optional[str]:
         """Find the cdb.exe executable"""
@@ -191,19 +234,31 @@ class CDBSession:
                     line = buffer.decode("utf-8", errors="replace")
                     buffer.clear()
                     if self.verbose:
-                        _timestamped_print(f"CDB > {line}")
+                        self.logger.debug(
+                            "CDB output preview: %s",
+                            sanitize_output_text(line),
+                            extra=make_context(event="cdb.output", outcome="streaming"),
+                        )
                     self._emit_line(line)
                     continue
 
                 buffer.extend(chunk)
         except (IOError, ValueError) as e:
             if self.verbose:
-                _timestamped_print(f"CDB output reader error: {e}")
+                self.logger.warning(
+                    "CDB output reader error: %s",
+                    sanitize_exception_message(str(e)),
+                    extra=make_context(event="cdb.output", outcome="error"),
+                )
         finally:
             if buffer:
                 line = buffer.decode("utf-8", errors="replace")
                 if self.verbose:
-                    _timestamped_print(f"CDB > {line}")
+                    self.logger.debug(
+                        "CDB output preview: %s",
+                        sanitize_output_text(line),
+                        extra=make_context(event="cdb.output", outcome="streaming"),
+                    )
                 self._emit_line(line)
 
     def send_command(self, command: str, timeout: Optional[int] = None) -> list[str]:
@@ -249,6 +304,7 @@ class CDBSession:
         # hard limit instead.
         cmd_wall_timeout = MAX_COMMAND_WALL_TIME_HARD_LIMIT_SECONDS
         request_id = self._next_request_id()
+        command_preview = sanitize_command(command)
         execution = CommandExecution(
             request_id=request_id,
             command=command,
@@ -258,6 +314,16 @@ class CDBSession:
         interrupt_deadline: Optional[float] = None
 
         with self.command_lock:
+            session_logger = self._ensure_logger()
+            session_logger.info(
+                "Executing CDB command",
+                extra=make_context(
+                    event="cdb.command",
+                    outcome="started",
+                    request_id=request_id,
+                    command_preview=command_preview,
+                ),
+            )
             try:
                 with self._state_lock:
                     self._active_execution = execution
@@ -265,20 +331,57 @@ class CDBSession:
                 self.process.stdin.write(f"{command}\n{COMMAND_MARKER}\n".encode("utf-8"))
                 self.process.stdin.flush()
             except IOError as e:
+                session_logger.exception(
+                    "Failed to send command to CDB: %s",
+                    sanitize_exception_message(str(e)),
+                    extra=make_context(
+                        event="cdb.command",
+                        outcome="error",
+                        request_id=request_id,
+                        command_preview=command_preview,
+                    ),
+                )
                 raise CDBError(f"Failed to send command: {str(e)}")
 
             try:
                 while True:
                     now = time.time()
                     if now - execution.started_at > cmd_wall_timeout:
+                        session_logger.warning(
+                            "Command exceeded hard wall timeout",
+                            extra=make_context(
+                                event="cdb.command",
+                                outcome="timeout",
+                                request_id=request_id,
+                                command_preview=command_preview,
+                            ),
+                        )
                         raise CDBError(
                             f"Command exceeded max wall time after {cmd_wall_timeout} seconds: {command}"
                         )
                     if now - last_activity_at > cmd_idle_timeout:
+                        session_logger.warning(
+                            "Command exceeded idle timeout",
+                            extra=make_context(
+                                event="cdb.command",
+                                outcome="timeout",
+                                request_id=request_id,
+                                command_preview=command_preview,
+                            ),
+                        )
                         raise CDBError(f"Command idle timed out after {cmd_idle_timeout} seconds: {command}")
 
                     if cancel_event and cancel_event.is_set() and not execution.cancelled:
                         execution.cancelled = True
+                        session_logger.info(
+                            "Cancellation requested for CDB command",
+                            extra=make_context(
+                                event="cdb.command",
+                                outcome="cancelling",
+                                request_id=request_id,
+                                command_preview=command_preview,
+                            ),
+                        )
                         try:
                             self.send_ctrl_break()
                         except CDBError:
@@ -316,6 +419,17 @@ class CDBSession:
                 with self._state_lock:
                     self._active_execution = None
 
+        session_logger.info(
+            "CDB command finished in %sms with %s output lines",
+            int((time.time() - execution.started_at) * 1000),
+            len(execution.output_lines),
+            extra=make_context(
+                event="cdb.command",
+                outcome="success" if not execution.cancelled else "cancelled",
+                request_id=request_id,
+                command_preview=command_preview,
+            ),
+        )
         return {
             "request_id": execution.request_id,
             "command": execution.command,
@@ -326,6 +440,7 @@ class CDBSession:
 
     def shutdown(self):
         """Clean up and terminate the CDB process"""
+        session_logger = self._ensure_logger()
         try:
             if self.process and self.process.poll() is None:
                 try:
@@ -339,10 +454,17 @@ class CDBSession:
                     self.process.terminate()
                     self.process.wait(timeout=3)
         except Exception as e:
-            if self.verbose:
-                _timestamped_print(f"Error during shutdown: {e}")
+            session_logger.exception(
+                "Error during CDB shutdown: %s",
+                sanitize_exception_message(str(e)),
+                extra=make_context(event="cdb.session", outcome="error"),
+            )
         finally:
             self.process = None
+            session_logger.info(
+                "CDB session shutdown completed",
+                extra=make_context(event="cdb.session", outcome="stopped"),
+            )
 
     def send_ctrl_break(self) -> None:
         """Send a CTRL+BREAK event to the CDB process to break in.
@@ -354,6 +476,10 @@ class CDBSession:
             raise CDBError("CDB process is not running")
 
         try:
+            self._ensure_logger().info(
+                "Sending CTRL+BREAK to CDB process",
+                extra=make_context(event="cdb.command", outcome="interrupt"),
+            )
             self.process.send_signal(signal.CTRL_BREAK_EVENT)
         except Exception as e:
             raise CDBError(f"Failed to send CTRL+BREAK: {str(e)}")

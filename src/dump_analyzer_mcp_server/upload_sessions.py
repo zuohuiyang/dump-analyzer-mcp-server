@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from .logging_utils import make_context, sanitize_exception_message, sanitize_path
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_UPLOAD_MB = 100
@@ -222,12 +224,20 @@ def create_upload_session(file_name: str, file_size: int) -> Dict[str, object]:
         raise ValueError("file_size must be greater than 0")
     max_bytes = upload_runtime_config.max_upload_mb * 1024 * 1024
     if file_size > max_bytes:
+        logger.warning(
+            "Upload session rejected because file exceeds configured limit",
+            extra=make_context(event="upload.session.create", outcome="rejected"),
+        )
         raise UploadSessionLimitError(f"file_size exceeds limit: {upload_runtime_config.max_upload_mb}MB")
 
     cleanup_expired_upload_sessions()
 
     with session_registry.lock:
         if len(session_registry.upload_sessions) >= upload_runtime_config.max_active_sessions:
+            logger.warning(
+                "Upload session rejected because active session limit was reached",
+                extra=make_context(event="upload.session.create", outcome="rejected"),
+            )
             raise UploadSessionLimitError(
                 f"maximum active upload sessions reached ({upload_runtime_config.max_active_sessions})"
             )
@@ -240,6 +250,11 @@ def create_upload_session(file_name: str, file_size: int) -> Dict[str, object]:
         )
         metadata.touch(upload_runtime_config.session_ttl_seconds)
         session_registry.upload_sessions[file_id] = metadata
+        logger.info(
+            "Upload session created for %s",
+            sanitize_path(original_file_name),
+            extra=make_context(event="upload.session.create", outcome="success", file_id=file_id),
+        )
         return {
             "file_id": file_id,
             "expires_at": metadata.expires_at.isoformat() if metadata.expires_at else "",
@@ -267,8 +282,20 @@ def cleanup_expired_upload_sessions(now: Optional[datetime] = None) -> int:
             try:
                 cdb.shutdown()
             except Exception:
-                logger.exception("Failed to shutdown CDB session for expired file_id=%s", metadata.file_id)
+                logger.exception(
+                    "Failed to shutdown CDB session for expired upload session",
+                    extra=make_context(event="upload.session.expire", outcome="error", file_id=metadata.file_id),
+                )
         cleanup_temp_upload_file(metadata.temp_file_path)
+        logger.info(
+            "Expired upload session cleaned up",
+            extra=make_context(
+                event="upload.session.expire",
+                outcome="expired",
+                file_id=metadata.file_id,
+                session_id=metadata.analysis_session_id,
+            ),
+        )
     return removed
 
 
@@ -276,21 +303,41 @@ def prepare_upload_session_for_upload(file_id: str, ttl_seconds: int) -> Tuple[O
     with session_registry.lock:
         metadata = session_registry.upload_sessions.get(file_id)
     if metadata is None:
+        logger.warning(
+            "Upload session not found during upload preparation",
+            extra=make_context(event="upload.session.prepare", outcome="missing", file_id=file_id),
+        )
         return None, "not_found", "Upload session not found"
     if not metadata.upload_lock.acquire(blocking=False):
+        logger.warning(
+            "Upload session is busy",
+            extra=make_context(event="upload.session.prepare", outcome="busy", file_id=file_id),
+        )
         return None, "busy", "Upload session is already processing an upload"
 
     with session_registry.lock:
         latest = session_registry.upload_sessions.get(file_id)
         if latest is None:
             metadata.upload_lock.release()
+            logger.warning(
+                "Upload session disappeared before upload began",
+                extra=make_context(event="upload.session.prepare", outcome="missing", file_id=file_id),
+            )
             return None, "not_found", "Upload session not found"
         metadata = latest
         if metadata.status != UploadSessionStatus.PENDING:
             metadata.upload_lock.release()
+            logger.warning(
+                "Upload session is in invalid state for upload start",
+                extra=make_context(event="upload.session.prepare", outcome="invalid", file_id=file_id),
+            )
             return None, "invalid_state", f"Upload session state is {metadata.status.value}, expected pending"
         metadata.status = UploadSessionStatus.UPLOADING
         metadata.touch(ttl_seconds)
+        logger.info(
+            "Upload session entered uploading state",
+            extra=make_context(event="upload.session.prepare", outcome="success", file_id=file_id),
+        )
         return metadata, "", ""
 
 
@@ -298,19 +345,35 @@ def mark_upload_failed(metadata: UploadSessionMetadata) -> None:
     with session_registry.lock:
         session_registry.upload_sessions.pop(metadata.file_id, None)
     cleanup_temp_upload_file(metadata.temp_file_path)
+    logger.info(
+        "Upload session marked failed and temporary data cleaned",
+        extra=make_context(event="upload.session.fail", outcome="failed", file_id=metadata.file_id),
+    )
 
 
 def mark_upload_completed(metadata: UploadSessionMetadata, ttl_seconds: int, uploaded_size: int) -> Optional[str]:
     with session_registry.lock:
         current = session_registry.upload_sessions.get(metadata.file_id)
         if current is not metadata:
+            logger.warning(
+                "Upload completion target was not found",
+                extra=make_context(event="upload.session.complete", outcome="missing", file_id=metadata.file_id),
+            )
             return "Upload session not found"
         if uploaded_size != metadata.expected_file_size:
             session_registry.upload_sessions.pop(metadata.file_id, None)
             cleanup_temp_upload_file(metadata.temp_file_path)
+            logger.warning(
+                "Upload size mismatch during completion",
+                extra=make_context(event="upload.session.complete", outcome="invalid", file_id=metadata.file_id),
+            )
             return f"Uploaded file size mismatch: expected {metadata.expected_file_size}, got {uploaded_size}"
         metadata.status = UploadSessionStatus.UPLOADED
         metadata.touch(ttl_seconds)
+    logger.info(
+        "Upload session marked uploaded",
+        extra=make_context(event="upload.session.complete", outcome="success", file_id=metadata.file_id),
+    )
     return None
 
 
@@ -327,10 +390,22 @@ def acquire_uploaded_file_for_analysis(file_id: str, ttl_seconds: int) -> Tuple[
     with session_registry.lock:
         metadata = session_registry.upload_sessions.get(file_id)
         if metadata is None:
+            logger.warning(
+                "Uploaded file not found for analysis",
+                extra=make_context(event="analysis.acquire_file", outcome="missing", file_id=file_id),
+            )
             return None, "Upload session not found"
         if metadata.status != UploadSessionStatus.UPLOADED:
+            logger.warning(
+                "Uploaded file is not ready for analysis",
+                extra=make_context(event="analysis.acquire_file", outcome="invalid", file_id=file_id),
+            )
             return None, f"Upload session state is {metadata.status.value}, expected uploaded"
         metadata.touch(ttl_seconds)
+        logger.info(
+            "Uploaded file acquired for analysis",
+            extra=make_context(event="analysis.acquire_file", outcome="success", file_id=file_id),
+        )
         return metadata, None
 
 
@@ -345,6 +420,15 @@ def get_or_create_analysis_session(file_id: str, ttl_seconds: int) -> Tuple[Opti
             analysis = session_registry.analysis_sessions[metadata.analysis_session_id]
             analysis.touch(ttl_seconds)
             metadata.touch(ttl_seconds)
+            logger.info(
+                "Reusing existing analysis session",
+                extra=make_context(
+                    event="analysis.session.create",
+                    outcome="reused",
+                    file_id=file_id,
+                    session_id=analysis.session_id,
+                ),
+            )
             return analysis, None
         session_id = uuid.uuid4().hex
         analysis = AnalysisSessionMetadata(session_id=session_id, file_id=file_id, status=AnalysisSessionStatus.CREATED)
@@ -352,6 +436,10 @@ def get_or_create_analysis_session(file_id: str, ttl_seconds: int) -> Tuple[Opti
         metadata.analysis_session_id = session_id
         metadata.touch(ttl_seconds)
         session_registry.analysis_sessions[session_id] = analysis
+        logger.info(
+            "Analysis session created",
+            extra=make_context(event="analysis.session.create", outcome="success", file_id=file_id, session_id=session_id),
+        )
         return analysis, None
 
 
@@ -367,6 +455,15 @@ def acquire_analysis_session(session_id: str, ttl_seconds: int) -> Tuple[Optiona
         upload.touch(ttl_seconds)
         upload.is_analyzing = True
         analysis.status = AnalysisSessionStatus.RUNNING
+        logger.info(
+            "Analysis session acquired for command execution",
+            extra=make_context(
+                event="analysis.session.acquire",
+                outcome="success",
+                file_id=upload.file_id,
+                session_id=session_id,
+            ),
+        )
         return analysis, upload, None
 
 
@@ -380,12 +477,25 @@ def release_analysis_session(session_id: str, ttl_seconds: int) -> None:
         if upload is not None:
             upload.is_analyzing = False
             upload.touch(ttl_seconds)
+        logger.info(
+            "Analysis session released after command execution",
+            extra=make_context(
+                event="analysis.session.release",
+                outcome="success",
+                file_id=analysis.file_id,
+                session_id=session_id,
+            ),
+        )
 
 
 def close_analysis_session(session_id: str) -> Tuple[Optional[Dict[str, object]], str, str]:
     with session_registry.lock:
         analysis = session_registry.analysis_sessions.pop(session_id, None)
         if analysis is None:
+            logger.warning(
+                "Analysis session close requested for unknown session",
+                extra=make_context(event="analysis.session.close", outcome="missing", session_id=session_id),
+            )
             return None, "not_found", "Analysis session not found"
         upload = session_registry.upload_sessions.pop(analysis.file_id, None)
         cdb = session_registry.cdb_sessions.pop(build_upload_cdb_session_key(session_id), None)
@@ -395,9 +505,21 @@ def close_analysis_session(session_id: str) -> Tuple[Optional[Dict[str, object]]
         try:
             cdb.shutdown()
         except Exception:
-            logger.exception("Failed to shutdown CDB session for session_id=%s", session_id)
+            logger.exception(
+                "Failed to shutdown CDB session while closing analysis session",
+                extra=make_context(
+                    event="analysis.session.close",
+                    outcome="error",
+                    file_id=analysis.file_id,
+                    session_id=session_id,
+                ),
+            )
     if upload:
         cleanup_temp_upload_file(upload.temp_file_path)
+    logger.info(
+        "Analysis session closed",
+        extra=make_context(event="analysis.session.close", outcome="success", file_id=analysis.file_id, session_id=session_id),
+    )
     return {"session_id": session_id, "status": "closed"}, "", ""
 
 
@@ -414,17 +536,29 @@ def get_or_create_cdb_session(session_key: str, factory):
     with session_registry.lock:
         existing = session_registry.cdb_sessions.get(session_key)
         if existing is not None:
+            logger.info(
+                "Reusing existing CDB session",
+                extra=make_context(event="cdb.session.get_or_create", outcome="reused", session_id=session_key),
+            )
             return existing
     with _get_cdb_creation_lock(session_key):
         with session_registry.lock:
             existing = session_registry.cdb_sessions.get(session_key)
             if existing is not None:
+                logger.info(
+                    "Reusing existing CDB session after waiting on creation lock",
+                    extra=make_context(event="cdb.session.get_or_create", outcome="reused", session_id=session_key),
+                )
                 return existing
         created = factory()
         with session_registry.lock:
             current = session_registry.cdb_sessions.get(session_key)
             if current is None:
                 session_registry.cdb_sessions[session_key] = created
+                logger.info(
+                    "Created new CDB session",
+                    extra=make_context(event="cdb.session.get_or_create", outcome="success", session_id=session_key),
+                )
                 return created
             existing = current
     shutdown = getattr(created, "shutdown", None)
@@ -432,7 +566,14 @@ def get_or_create_cdb_session(session_key: str, factory):
         try:
             shutdown()
         except Exception:
-            logger.exception("Failed to shut down duplicate CDB session for key %s", session_key)
+            logger.exception(
+                "Failed to shut down duplicate CDB session",
+                extra=make_context(event="cdb.session.get_or_create", outcome="error", session_id=session_key),
+            )
+    logger.info(
+        "Discarded duplicate CDB session after race",
+        extra=make_context(event="cdb.session.get_or_create", outcome="duplicate", session_id=session_key),
+    )
     return existing
 
 
@@ -453,6 +594,10 @@ def cleanup_sessions() -> None:
                 pass
     for metadata in uploads:
         cleanup_temp_upload_file(metadata.temp_file_path)
+    logger.info(
+        "Process-wide session cleanup completed",
+        extra=make_context(event="session.cleanup_all", outcome="success"),
+    )
 
 
 session_registry = SessionRegistry()

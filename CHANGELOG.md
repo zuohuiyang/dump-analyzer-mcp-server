@@ -18,6 +18,8 @@ Note:
 - 新增命令阶段状态：`queued/running/completed`
 - 新增危险命令拦截策略，默认严格拒绝执行
 - 在 README 中新增安全边界说明：服务默认用于内网/可信环境，当前不内置鉴权，公网使用需前置鉴权与 TLS
+- 新增服务器日志系统：默认文件日志、按天轮转、保留关键审计字段，并支持通过 CLI 配置日志目录、级别与保留策略
+- 新增日志目录总大小限制参数 `--log-max-total-size-mb`，默认 `2048MB`
 
 ### Changed
 
@@ -29,12 +31,16 @@ Note:
 - `pending` 阶段命名替换为 `queued`
 - 调用方不再可配置符号路径，仅允许服务端管理员通过 CLI/环境变量配置
 - 移除不再使用的 prompt 子系统代码与文件
+- 服务器日志默认采用脱敏与截断策略，不再直接把完整 CDB 输出打印到控制台；多人并发调用时可通过 `request_id/file_id/session_id` 关联排障
+- 日志清理策略扩展为“按天轮转 + 总目录大小上限”，超出限制时自动删除最老轮转日志
+- 单个活动日志文件新增硬编码 `100MB` 上限，超过后服务会立即切换到新的活动日志文件
 
 ### Fixed
 
 - **Upload Session Cleanup**: Clean up failed upload sessions immediately, reject expired uploaded sessions on access, and allow expired stale uploading sessions to be reclaimed safely
 - 版本一致性脚本改为忽略 `Unreleased` 标题，按首个正式版本校验
 - 修复 CDB 输出处理中 `\r` 进度行不及时透传的问题
+- 修复服务端缺少长期运行日志落盘、并发会话缺少统一关联字段、以及日志中可能泄露完整本地路径/危险命令摘要的问题
 
 ## [0.1.0] - 2026-04-15
 

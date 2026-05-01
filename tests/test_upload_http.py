@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import logging
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,22 @@ def test_put_upload_dump_succeeds_and_marks_session_uploaded():
         assert Path(metadata.temp_file_path).read_bytes() == b"MDMPxxxx"
 
 
+def test_put_upload_dump_emits_audit_log_without_temp_path(caplog):
+    payload = server.create_upload_session("logged.dmp", 8)
+    metadata = server.session_registry.upload_sessions[payload["file_id"]]
+    app = server.create_http_app()
+
+    with caplog.at_level(logging.INFO):
+        with TestClient(app) as client:
+            response = client.put(server.build_upload_path(payload["file_id"]), content=b"MDMPxxxx")
+
+    assert response.status_code == 201
+    assert any(getattr(record, "file_id", "") == payload["file_id"] for record in caplog.records)
+    assert any(getattr(record, "event", "") == "upload.put" for record in caplog.records)
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert metadata.temp_file_path not in combined
+
+
 def test_put_upload_dump_rejects_invalid_signature_and_rolls_back():
     payload = server.create_upload_session("bad.dmp", 7)
     metadata = server.session_registry.upload_sessions[payload["file_id"]]
@@ -66,6 +83,22 @@ def test_put_upload_dump_rejects_invalid_signature_and_rolls_back():
     assert "Upload the raw bytes" in response.json()["error"]["remediation"]
     assert payload["file_id"] not in server.session_registry.upload_sessions
     assert not Path(metadata.temp_file_path).exists()
+
+
+def test_invalid_upload_logs_failure_without_temp_path(caplog):
+    payload = server.create_upload_session("badlog.dmp", 7)
+    metadata = server.session_registry.upload_sessions[payload["file_id"]]
+    app = server.create_http_app()
+
+    with caplog.at_level(logging.INFO):
+        with TestClient(app) as client:
+            response = client.put(server.build_upload_path(payload["file_id"]), content=b"NOTDUMP")
+
+    assert response.status_code == 400
+    assert any(getattr(record, "file_id", "") == payload["file_id"] for record in caplog.records)
+    assert any(getattr(record, "outcome", "") in {"failed", "invalid"} for record in caplog.records)
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert metadata.temp_file_path not in combined
 
 
 def test_put_upload_dump_rejects_size_mismatch():

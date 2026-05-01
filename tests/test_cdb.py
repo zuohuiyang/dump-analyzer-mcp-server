@@ -1,3 +1,5 @@
+import io
+import logging
 import os
 import threading
 import time
@@ -6,6 +8,7 @@ import pytest
 
 import dump_analyzer_mcp_server.cdb_session as cdb_session_module
 from dump_analyzer_mcp_server.cdb_session import CDBSession
+from dump_analyzer_mcp_server.logging_utils import bind_context
 from tests.test_support import has_available_cdb
 
 # Path to the test dump file
@@ -142,6 +145,70 @@ def test_execute_command_heartbeat_callback_invoked():
     result = session.execute_command("kb", timeout=1, on_heartbeat=lambda: heartbeats.append("hb"), heartbeat_interval=0.01)
     assert result["output_lines"] == ["line"]
     assert len(heartbeats) >= 1
+
+
+def test_execute_command_logs_request_context(caplog):
+    session = object.__new__(CDBSession)
+    session.process = SimpleNamespace()
+    session.timeout = 1
+    session.verbose = False
+    session.command_lock = threading.Lock()
+    session._state_lock = threading.Lock()
+    session._active_execution = None
+    session._request_counter = 0
+    session.log_context = {"file_id": "file-1", "session_id": "session-1"}
+    session.logger = bind_context(
+        logging.getLogger("dump_analyzer_mcp_server.cdb_session"),
+        event="cdb.session",
+        file_id="file-1",
+        session_id="session-1",
+    )
+
+    class FakeStdin:
+        def write(self, _payload: bytes) -> None:
+            execution = session._active_execution
+            execution.output_lines.append("out:kb")
+            execution.completed = True
+            execution.done_event.set()
+
+        def flush(self) -> None:
+            return None
+
+    session.process.stdin = FakeStdin()
+
+    with caplog.at_level(logging.INFO, logger="dump_analyzer_mcp_server.cdb_session"):
+        result = session.execute_command("kb", timeout=1)
+
+    assert result["request_id"] == "1"
+    command_records = [record for record in caplog.records if getattr(record, "event", "") == "cdb.command"]
+    assert command_records
+    assert any(getattr(record, "request_id", "") == "1" for record in command_records)
+    assert all(getattr(record, "session_id", "") == "session-1" for record in command_records)
+
+
+def test_verbose_reader_logs_truncated_output(caplog):
+    session = object.__new__(CDBSession)
+    session.process = SimpleNamespace(stdout=io.BytesIO((b"A" * 450) + b"\n"))
+    session.timeout = 1
+    session.verbose = True
+    session.command_lock = threading.Lock()
+    session._state_lock = threading.Lock()
+    session._active_execution = None
+    session._request_counter = 0
+    session.log_context = {"file_id": "file-1", "session_id": "session-1"}
+    session.logger = bind_context(
+        logging.getLogger("dump_analyzer_mcp_server.cdb_session"),
+        event="cdb.session",
+        file_id="file-1",
+        session_id="session-1",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="dump_analyzer_mcp_server.cdb_session"):
+        session._read_output_bytes()
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "<truncated>" in messages
+    assert "A" * 430 not in messages
 
 if __name__ == "__main__":
     pytest.main(["-v", __file__])

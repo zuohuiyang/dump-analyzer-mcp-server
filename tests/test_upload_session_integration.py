@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from mcp.types import CallToolRequest
@@ -57,6 +59,11 @@ def _mark_uploaded_dump(file_name: str):
     Path(metadata.temp_file_path).write_bytes(b"MDMPxxxx")
     metadata.status = server.UploadSessionStatus.UPLOADED
     return payload, metadata
+
+
+class _FakeRequestSession:
+    async def send_progress_notification(self, **_kwargs):
+        return None
 
 
 def test_start_analysis_session_creates_reusable_session():
@@ -185,6 +192,79 @@ def test_execute_windbg_command_blocks_dangerous_command():
 
     assert result.isError is True
     assert "DANGEROUS_COMMAND_BLOCKED" in result.content[0].text
+
+
+def test_blocked_dangerous_command_logs_masked_preview(caplog, monkeypatch):
+    payload, _metadata = _mark_uploaded_dump("dangerous-log.dmp")
+    app_server = server._create_server()
+    monkeypatch.setattr(
+        server,
+        "_try_get_request_context",
+        lambda _server: SimpleNamespace(request_id="req-123", session=_FakeRequestSession()),
+    )
+    handler = app_server.request_handlers[CallToolRequest]
+    start_request = CallToolRequest(
+        method="tools/call",
+        params={"name": "start_analysis_session", "arguments": {"file_id": payload["file_id"]}},
+    )
+    start_result = asyncio.run(handler(start_request)).root
+    session_id = json.loads(start_result.content[0].text)["session_id"]
+
+    request = CallToolRequest(
+        method="tools/call",
+        params={
+            "name": "execute_windbg_command",
+            "arguments": {
+                "session_id": session_id,
+                "command": ".shell whoami /all",
+            },
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(handler(request)).root
+
+    assert result.isError is True
+    blocked_records = [record for record in caplog.records if getattr(record, "outcome", "") == "blocked"]
+    assert blocked_records
+    assert any(getattr(record, "command_preview", "") == "<blocked:.shell>" for record in blocked_records)
+    assert all(".shell whoami /all" not in getattr(record, "command_preview", "") for record in blocked_records)
+
+
+def test_execute_command_logs_correlated_ids(caplog, monkeypatch):
+    payload, _metadata = _mark_uploaded_dump("correlated.dmp")
+    app_server = server._create_server()
+    monkeypatch.setattr(
+        server,
+        "_try_get_request_context",
+        lambda _server: SimpleNamespace(request_id="req-456", session=_FakeRequestSession()),
+    )
+    handler = app_server.request_handlers[CallToolRequest]
+
+    with caplog.at_level(logging.INFO):
+        start_request = CallToolRequest(
+            method="tools/call",
+            params={"name": "start_analysis_session", "arguments": {"file_id": payload["file_id"]}},
+        )
+        start_result = asyncio.run(handler(start_request)).root
+        session_id = json.loads(start_result.content[0].text)["session_id"]
+
+        execute_request = CallToolRequest(
+            method="tools/call",
+            params={
+                "name": "execute_windbg_command",
+                "arguments": {"session_id": session_id, "command": "kb"},
+            },
+        )
+        execute_result = asyncio.run(handler(execute_request)).root
+
+    assert execute_result.isError is False
+    assert any(
+        getattr(record, "request_id", "") == "req-456"
+        and getattr(record, "file_id", "") == payload["file_id"]
+        and getattr(record, "session_id", "") == session_id
+        for record in caplog.records
+    )
 
 
 def test_close_analysis_session_closes_uploaded_session_and_removes_temp_file():
