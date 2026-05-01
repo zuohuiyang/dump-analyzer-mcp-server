@@ -32,6 +32,13 @@ def test_new_tool_schemas_match_expected_params():
     assert "file_size" in tool_map["prepare_dump_upload"].inputSchema["properties"]
     assert "file_name" in tool_map["prepare_dump_upload"].inputSchema["properties"]
     assert "file_id" in tool_map["start_analysis_session"].inputSchema["properties"]
+    assert "sym_noisy" in tool_map["start_analysis_session"].inputSchema["properties"]
     assert "session_id" in tool_map["execute_windbg_command"].inputSchema["properties"]
     assert "command" in tool_map["execute_windbg_command"].inputSchema["properties"]
     assert "timeout" in tool_map["execute_windbg_command"].inputSchema["properties"]
+
+
+def test_tool_descriptions_include_non_streaming_guidance():
+    tool_map = _get_tool_map()
+    assert "sym_noisy" in tool_map["start_analysis_session"].description
+    assert ".lastevent" in tool_map["execute_windbg_command"].description

@@ -140,12 +140,19 @@ class PrepareDumpUploadParams(BaseModel):
 
 class StartAnalysisSessionParams(BaseModel):
     file_id: str = Field(description="File ID returned after a successful upload")
+    sym_noisy: bool = Field(
+        default=True,
+        description="Enable !sym noisy for this analysis session before running later commands",
+    )
 
 
 class ExecuteWindbgCommandParams(BaseModel):
     session_id: str = Field(description="Analysis session ID")
     command: str = Field(description="CDB command to execute")
-    timeout: int = Field(default=600, description="Idle timeout in seconds, applied when there is no output")
+    timeout: int = Field(
+        default=1800,
+        description="Command timeout in seconds; if the command has not completed within this period, it returns status=timeout",
+    )
 
     @model_validator(mode="after")
     def validate_timeout(self):
@@ -309,6 +316,17 @@ def _upload_error_payload(
     return payload
 
 
+def _build_suggested_next_step(result: Dict[str, object]) -> Optional[str]:
+    status = str(result.get("status") or "")
+    if status == "timeout":
+        if result.get("first_output_delay_ms") is None:
+            return "Retry with a larger timeout or run a lighter command first, such as .lastevent or .ecxr;kv."
+        return "Review the partial output, then retry with a larger timeout or continue with a lighter follow-up command."
+    if status == "cancelled":
+        return "Retry the command if you still need the full output."
+    return None
+
+
 async def _stream_upload_to_file(
     request,
     target_path: str,
@@ -349,7 +367,7 @@ async def serve_http(
     port: int = 8000,
     cdb_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
-    timeout: int = 30,
+    timeout: int = 1800,
     verbose: bool = False,
     public_base_url_override: Optional[str] = None,
     upload_dir: Optional[str] = None,
@@ -411,7 +429,7 @@ async def serve_http(
 def create_http_app(
     cdb_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
-    timeout: int = 30,
+    timeout: int = 1800,
     verbose: bool = False,
     public_base_url_override: Optional[str] = None,
 ):
@@ -628,7 +646,7 @@ def create_http_app(
 def _create_server(
     cdb_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
-    timeout: int = 30,
+    timeout: int = 1800,
     verbose: bool = False,
 ) -> Server:
     import mcp.types as types
@@ -645,12 +663,22 @@ def _create_server(
             ),
             Tool(
                 name="start_analysis_session",
-                description="Start a crash dump analysis session and load the dump file and symbols. This may take 3-10 minutes and reports progress in real time.",
+                description=(
+                    "Start a crash dump analysis session and load the dump file and symbols. "
+                    "sym_noisy defaults to true so the session enables !sym noisy before later commands. "
+                    "For hosts without visible streaming progress, prefer lighter follow-up commands first, "
+                    "such as .lastevent or .ecxr;kv, before heavier analysis."
+                ),
                 inputSchema=StartAnalysisSessionParams.model_json_schema(),
             ),
             Tool(
                 name="execute_windbg_command",
-                description="Execute any CDB command in an analysis session and stream the raw output. Long-running commands send heartbeats automatically to keep the connection alive.",
+                description=(
+                    "Execute any CDB command in an analysis session and stream the raw output. "
+                    "For hosts without visible streaming progress, prefer .lastevent -> .ecxr;kv -> "
+                    "lmv m <module> before !analyze -v. On timeout, the server returns structured status "
+                    "instead of a tool error."
+                ),
                 inputSchema=ExecuteWindbgCommandParams.model_json_schema(),
             ),
             Tool(
@@ -724,7 +752,7 @@ def _create_server(
                         ErrorData(code=INVALID_PARAMS, message=f"{UPLOAD_ERROR_INVALID_STATE}: {error_message}")
                     )
 
-                upload_sessions.get_or_create_cdb_session(
+                session = upload_sessions.get_or_create_cdb_session(
                     upload_sessions.build_upload_cdb_session_key(analysis.session_id),
                     lambda: CDBSession(
                         dump_path=metadata.temp_file_path,
@@ -739,6 +767,21 @@ def _create_server(
                         },
                     ),
                 )
+                if args.sym_noisy:
+                    try:
+                        session.ensure_symbol_diagnostics(timeout=timeout)
+                    except CDBError as exc:
+                        start_logger.exception(
+                            "Failed to enable symbol diagnostics: %s",
+                            sanitize_exception_message(str(exc)),
+                            extra=make_context(outcome="error"),
+                        )
+                        raise McpError(
+                            ErrorData(
+                                code=INTERNAL_ERROR,
+                                message="Failed to enable symbol diagnostics for the new analysis session.",
+                            )
+                        ) from exc
                 payload = {"session_id": analysis.session_id, "file_id": args.file_id, "status": "ready"}
                 start_logger.info(
                     "Analysis session ready",
@@ -882,13 +925,20 @@ def _create_server(
                         5.0,
                         cancel_event,
                     )
-                    await _send_tool_progress("completed", "Command completed")
-                    command_logger.info(
-                        "Command completed in %sms with %s output lines",
+                    completion_message = (
+                        "Command timed out"
+                        if result["status"] == "timeout"
+                        else ("Command cancelled" if result["status"] == "cancelled" else "Command completed")
+                    )
+                    await _send_tool_progress("completed", completion_message)
+                    log_method = command_logger.warning if result["status"] == "timeout" else command_logger.info
+                    log_method(
+                        "Command finished with status=%s in %sms with %s output lines",
+                        result["status"],
                         result["execution_time_ms"],
                         len(result["output_lines"]),
                         extra=make_context(
-                            outcome="success",
+                            outcome="timeout" if result["status"] == "timeout" else "success",
                             request_id=request_id,
                             file_id=metadata.file_id,
                             session_id=args.session_id,
@@ -896,12 +946,18 @@ def _create_server(
                         ),
                     )
                     payload = {
-                        "success": True,
+                        "success": result["status"] == "completed",
+                        "status": result["status"],
                         "command": args.command,
                         "output": "\n".join(result["output_lines"]),
                         "execution_time_ms": result["execution_time_ms"],
                         "cancelled": bool(result["cancelled"]),
+                        "timed_out": bool(result["timed_out"]),
+                        "first_output_delay_ms": result["first_output_delay_ms"],
                     }
+                    suggested_next_step = _build_suggested_next_step(result)
+                    if suggested_next_step:
+                        payload["suggested_next_step"] = suggested_next_step
                     return [TextContent(type="text", text=json.dumps(payload))]
                 finally:
                     with _running_lock:

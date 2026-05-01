@@ -147,6 +147,48 @@ def test_execute_command_heartbeat_callback_invoked():
     assert len(heartbeats) >= 1
 
 
+def test_execute_command_timeout_triggers_interrupt_even_with_heartbeats():
+    session = object.__new__(CDBSession)
+    session.process = SimpleNamespace()
+    session.timeout = 1
+    session.verbose = False
+    session.command_lock = threading.Lock()
+    session._state_lock = threading.Lock()
+    session._active_execution = None
+    session._request_counter = 0
+
+    class FakeStdin:
+        def write(self, _payload: bytes) -> None:
+            return None
+
+        def flush(self) -> None:
+            return None
+
+    session.process.stdin = FakeStdin()
+    heartbeats = []
+    interrupt_calls = []
+
+    def fake_send_ctrl_break():
+        interrupt_calls.append("interrupt")
+        execution = session._active_execution
+        execution.completed = True
+        execution.done_event.set()
+
+    session.send_ctrl_break = fake_send_ctrl_break
+
+    result = session.execute_command(
+        "kb",
+        timeout=0.05,
+        on_heartbeat=lambda: heartbeats.append("hb"),
+        heartbeat_interval=0.01,
+    )
+
+    assert result["status"] == "timeout"
+    assert result["timed_out"] is True
+    assert interrupt_calls == ["interrupt"]
+    assert len(heartbeats) >= 1
+
+
 def test_execute_command_logs_request_context(caplog):
     session = object.__new__(CDBSession)
     session.process = SimpleNamespace()

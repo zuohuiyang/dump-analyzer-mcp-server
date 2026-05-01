@@ -30,7 +30,7 @@
 
 1. 调用 `prepare_dump_upload(file_size, file_name)` 获取 `file_id` 和 `upload_url`
 2. 对 `upload_url` 发送 HTTP `PUT` 上传原始 dump 字节
-3. 调用 `start_analysis_session(file_id)` 获取 `session_id`
+3. 调用 `start_analysis_session(file_id, sym_noisy=true)` 获取 `session_id`
 4. 调用 `execute_windbg_command(session_id, command, timeout)` 执行 CDB 命令
 5. 调用 `close_analysis_session(session_id)` 释放资源
 
@@ -39,7 +39,8 @@
 - MCP 通道采用 `streamable-http`
 - 命令执行状态固定为：`queued`、`running`、`completed`
 - CDB 输出原样透传，不做语义解析
-- 命令长时间无输出时自动发送心跳，避免误判为卡死
+- 命令执行较久时自动发送心跳，避免误判为卡死
+- 即使宿主不展示流式进度，最终工具返回也会包含结构化执行状态
 
 ## 从源码启动
 
@@ -74,7 +75,7 @@ uv run dump-analyzer-mcp-server --host 0.0.0.0 --port 8000 --public-base-url htt
 | `--public-base-url` | 是 | 无 | 返回给客户端的可访问基址 |
 | `--cdb-path` | 否 | 自动探测 | `cdb.exe` 路径 |
 | `--symbols-path` | 否 | `srv*c:\symbols*https://msdl.microsoft.com/download/symbols` | 服务端符号路径 |
-| `--timeout` | 否 | `30` | 命令执行超时（秒） |
+| `--timeout` | 否 | `1800` | 命令执行超时（秒） |
 | `--upload-dir` | 否 | 系统默认目录 | 上传临时目录 |
 | `--max-upload-mb` | 否 | `100` | 最大上传大小（MB） |
 | `--session-ttl-seconds` | 否 | `1800` | 空闲会话 TTL（秒） |
@@ -114,6 +115,13 @@ uv run dump-analyzer-mcp-server --host 0.0.0.0 --port 8000 --public-base-url htt
 - 工具调用失败时返回结构化错误（含错误码与错误信息）
 - `prepare_dump_upload` 在无法生成可访问上传地址时返回 `UPLOAD_URL_UNAVAILABLE`
 - 上传大小、文件格式、会话上限等限制会在入口阶段尽早失败
+
+## 无流式宿主建议
+
+- 某些 MCP Host / IDE 只展示最终 tool result，不展示 progress/SSE；这类宿主应优先依赖最终返回中的 `status`、`timed_out`、`first_output_delay_ms` 和 `suggested_next_step`。
+- `start_analysis_session` 默认会开启 `!sym noisy`；如调用方明确不需要，可传 `sym_noisy=false`。
+- 推荐命令顺序：先 `.lastevent`、再 `.ecxr;kv`、再 `lmv m <module>`，最后再执行 `!analyze -v` 这类重命令。
+- `timeout` 表示命令在设定时间内还未执行完成；命中后服务端会尝试中断当前命令，并返回结构化结果而不是工具级错误。
 
 ## 开发文档
 

@@ -46,6 +46,8 @@ class CommandExecution:
     last_output_at: Optional[float] = None
     completed: bool = False
     cancelled: bool = False
+    timed_out: bool = False
+    status: str = "completed"
     output_lines: list[str] = field(default_factory=list)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
     line_queue: queue.Queue[str] = field(default_factory=queue.Queue, repr=False)
@@ -145,6 +147,7 @@ class CDBSession:
         self._state_lock = threading.Lock()
         self._active_execution: Optional[CommandExecution] = None
         self._request_counter = 0
+        self._symbol_diagnostics_enabled = False
         self._reader_thread = threading.Thread(target=self._read_output_bytes, daemon=True)
         self._reader_thread.start()
 
@@ -191,6 +194,43 @@ class CDBSession:
         with self._state_lock:
             self._request_counter += 1
             return str(self._request_counter)
+
+    def _build_command_result(self, execution: CommandExecution) -> dict:
+        first_output_delay_ms = None
+        if execution.first_output_at is not None:
+            first_output_delay_ms = int((execution.first_output_at - execution.started_at) * 1000)
+        return {
+            "request_id": execution.request_id,
+            "command": execution.command,
+            "output_lines": execution.output_lines.copy(),
+            "cancelled": execution.cancelled,
+            "timed_out": execution.timed_out,
+            "status": execution.status,
+            "first_output_delay_ms": first_output_delay_ms,
+            "execution_time_ms": int((time.time() - execution.started_at) * 1000),
+        }
+
+    def ensure_symbol_diagnostics(self, timeout: Optional[int] = None) -> dict:
+        with self._state_lock:
+            if getattr(self, "_symbol_diagnostics_enabled", False):
+                return {
+                    "request_id": "0",
+                    "command": "!sym noisy",
+                    "output_lines": [],
+                    "cancelled": False,
+                    "timed_out": False,
+                    "status": "completed",
+                    "first_output_delay_ms": None,
+                    "execution_time_ms": 0,
+                }
+
+        result = self.execute_command("!sym noisy", timeout=timeout)
+        if result["status"] != "completed":
+            raise CDBError("Failed to enable symbol diagnostics")
+
+        with self._state_lock:
+            self._symbol_diagnostics_enabled = True
+        return result
 
     def _emit_line(self, text: str) -> None:
         with self._state_lock:
@@ -292,16 +332,10 @@ class CDBSession:
         if not self.process or not self.process.stdin:
             raise CDBError("CDB process is not running")
 
-        # `timeout` means idle timeout (no output/heartbeat activity).
-        # Also derive a wall-time budget from it so long-running, chatty commands
-        # (e.g. `.reload /f` on symbol-heavy dumps) don't fail just because they
-        # exceed a historical fixed cutoff.
-        cmd_idle_timeout = timeout or self.timeout
-        # IMPORTANT: do not tie wall-time to idle timeout.
-        # Callers use `timeout` as *idle* timeout (see server API), and we keep sending
-        # heartbeats. A derived wall timeout would be arbitrary and can kill legitimate
-        # long-running operations (symbol loads, PDB downloads). Use a single generous
-        # hard limit instead.
+        # `timeout` is the externally visible command timeout. Once the command has not
+        # finished within this duration, we attempt to interrupt it and return status=timeout.
+        # A separate hard wall-time cap remains as a safety net for truly stuck commands.
+        cmd_timeout = timeout or self.timeout
         cmd_wall_timeout = MAX_COMMAND_WALL_TIME_HARD_LIMIT_SECONDS
         request_id = self._next_request_id()
         command_preview = sanitize_command(command)
@@ -310,7 +344,7 @@ class CDBSession:
             command=command,
             started_at=time.time(),
         )
-        last_activity_at = execution.started_at
+        last_heartbeat_at = execution.started_at
         interrupt_deadline: Optional[float] = None
 
         with self.command_lock:
@@ -359,9 +393,9 @@ class CDBSession:
                         raise CDBError(
                             f"Command exceeded max wall time after {cmd_wall_timeout} seconds: {command}"
                         )
-                    if now - last_activity_at > cmd_idle_timeout:
+                    if now - execution.started_at > cmd_timeout and not execution.cancelled and not execution.timed_out:
                         session_logger.warning(
-                            "Command exceeded idle timeout",
+                            "Command exceeded timeout before completion",
                             extra=make_context(
                                 event="cdb.command",
                                 outcome="timeout",
@@ -369,10 +403,17 @@ class CDBSession:
                                 command_preview=command_preview,
                             ),
                         )
-                        raise CDBError(f"Command idle timed out after {cmd_idle_timeout} seconds: {command}")
+                        execution.timed_out = True
+                        execution.status = "timeout"
+                        try:
+                            self.send_ctrl_break()
+                        except CDBError:
+                            pass
+                        interrupt_deadline = time.time() + 5.0
 
                     if cancel_event and cancel_event.is_set() and not execution.cancelled:
                         execution.cancelled = True
+                        execution.status = "cancelled"
                         session_logger.info(
                             "Cancellation requested for CDB command",
                             extra=make_context(
@@ -400,7 +441,6 @@ class CDBSession:
 
                     try:
                         line = execution.line_queue.get(timeout=0.2)
-                        last_activity_at = time.time()
                         if on_output:
                             on_output(line)
                     except queue.Empty:
@@ -408,10 +448,10 @@ class CDBSession:
                             on_heartbeat
                             and heartbeat_interval > 0
                             and not execution.completed
-                            and (time.time() - last_activity_at) >= heartbeat_interval
+                            and (time.time() - last_heartbeat_at) >= heartbeat_interval
                         ):
                             on_heartbeat()
-                            last_activity_at = time.time()
+                            last_heartbeat_at = time.time()
 
                     if execution.completed and execution.line_queue.empty():
                         break
@@ -425,18 +465,12 @@ class CDBSession:
             len(execution.output_lines),
             extra=make_context(
                 event="cdb.command",
-                outcome="success" if not execution.cancelled else "cancelled",
+                outcome="timeout" if execution.timed_out else ("cancelled" if execution.cancelled else "success"),
                 request_id=request_id,
                 command_preview=command_preview,
             ),
         )
-        return {
-            "request_id": execution.request_id,
-            "command": execution.command,
-            "output_lines": execution.output_lines.copy(),
-            "cancelled": execution.cancelled,
-            "execution_time_ms": int((time.time() - execution.started_at) * 1000),
-        }
+        return self._build_command_result(execution)
 
     def shutdown(self):
         """Clean up and terminate the CDB process"""

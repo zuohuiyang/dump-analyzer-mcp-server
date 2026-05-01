@@ -27,7 +27,7 @@ def main():
             "Default: srv*c:\\symbols*https://msdl.microsoft.com/download/symbols"
         ),
     )
-    parser.add_argument("--timeout", type=int, default=30, help="Command timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=1800, help="Command timeout in seconds")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument(
         "--log-dir",
