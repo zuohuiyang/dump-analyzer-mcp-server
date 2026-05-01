@@ -1,0 +1,84 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.zuohuiyang/dump-analyzer-mcp-server",
+  "title": "Dump Analyzer MCP Server",
+  "description": "A Model Context Protocol server for remote Windows crash dump analysis using WinDbg/CDB",
+  "repository": {
+    "url": "https://github.com/zuohuiyang/dump-analyzer-mcp-server",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "dump-analyzer-mcp-server",
+      "version": "0.1.0",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:{port}/mcp"
+      },
+      "runtimeHint": "uvx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--host",
+          "default": "127.0.0.1",
+          "description": "Host for HTTP transport"
+        },
+        {
+          "type": "named",
+          "name": "--port",
+          "valueHint": "port",
+          "default": "8000",
+          "description": "Port for HTTP transport"
+        },
+        {
+          "type": "named",
+          "name": "--public-base-url",
+          "description": "Client-reachable base URL used when returning upload_url; required for remote upload workflows"
+        },
+        {
+          "type": "named",
+          "name": "--cdb-path",
+          "description": "Custom path to cdb.exe (optional)"
+        },
+        {
+          "type": "named",
+          "name": "--symbols-path",
+          "description": "Symbol path for Windows debugging (optional)"
+        },
+        {
+          "type": "named",
+          "name": "--timeout",
+          "default": "30",
+          "description": "Default command timeout in seconds"
+        },
+        {
+          "type": "named",
+          "name": "--upload-dir",
+          "description": "Directory used for temporary uploaded dump storage"
+        },
+        {
+          "type": "named",
+          "name": "--max-upload-mb",
+          "default": "100",
+          "description": "Maximum upload size in megabytes for crash dump uploads"
+        },
+        {
+          "type": "named",
+          "name": "--session-ttl-seconds",
+          "default": "1800",
+          "description": "Time-to-live in seconds for inactive upload and analysis sessions"
+        },
+        {
+          "type": "named",
+          "name": "--max-active-sessions",
+          "default": "10",
+          "description": "Maximum number of active upload sessions"
+        }
+      ],
+      "environmentVariables": []
+    }
+  ]
+}

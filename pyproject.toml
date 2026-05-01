@@ -1,0 +1,56 @@
+[project]
+name = "dump-analyzer-mcp-server"
+version = "0.1.0"
+description = "A Model Context Protocol server for remote Windows crash dump analysis using WinDbg/CDB"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "zuohuiyang" }]
+maintainers = [{ name = "zuohuiyang" }]
+keywords = ["dump-analyzer", "windbg", "cdb", "mcp", "server"]
+license = "MIT"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "mcp>=1.26.0",
+    "pydantic>=2.12.5",
+    "starlette>=0.52.1",
+    "uvicorn>=0.42.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zuohuiyang/dump-analyzer-mcp-server"
+Repository = "https://github.com/zuohuiyang/dump-analyzer-mcp-server"
+Upstream = "https://github.com/svnscha/mcp-windbg"
+
+[project.scripts]
+dump-analyzer-mcp-server = "dump_analyzer_mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "twine>=6.2.0",
+    "jsonschema>=4.26.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "e2e: 端到端测试",
+    "e2e_remote: 远程已部署服务模式的 E2E",
+    "e2e_symbol_heavy: 大 PDB 长时间加载场景 E2E",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.0.2"]
