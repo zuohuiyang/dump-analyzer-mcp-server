@@ -47,9 +47,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "e2e: 端到端测试",
-    "e2e_remote: 远程已部署服务模式的 E2E",
-    "e2e_symbol_heavy: 大 PDB 长时间加载场景 E2E",
+    "e2e: end-to-end tests",
+    "e2e_remote: E2E for remotely deployed service mode",
+    "e2e_symbol_heavy: E2E for large-PDB long-loading scenarios",
 ]
 
 [project.optional-dependencies]

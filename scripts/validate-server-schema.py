@@ -16,7 +16,13 @@ Usage:
 import json
 import sys
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+
+
+def timestamped_print(message: str = "", *, file=None) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {message}", file=file)
 
 
 def main() -> int:
@@ -27,67 +33,67 @@ def main() -> int:
     server_json_path = repo_root / "server.json"
 
     if not server_json_path.exists():
-        print(f"ERROR: server.json not found at {server_json_path}", file=sys.stderr)
+        timestamped_print(f"ERROR: server.json not found at {server_json_path}", file=sys.stderr)
         return 1
 
-    print(f"Validating {server_json_path}...")
+    timestamped_print(f"Validating {server_json_path}...")
 
     # Load server.json
     try:
         with open(server_json_path, "r", encoding="utf-8") as f:
             server_data = json.load(f)
     except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON in server.json: {e}", file=sys.stderr)
+        timestamped_print(f"ERROR: Invalid JSON in server.json: {e}", file=sys.stderr)
         return 1
 
     # Extract schema URL
     schema_url = server_data.get("$schema")
     if not schema_url:
-        print("ERROR: No $schema field found in server.json", file=sys.stderr)
+        timestamped_print("ERROR: No $schema field found in server.json", file=sys.stderr)
         return 1
 
-    print(f"Schema URL: {schema_url}")
+    timestamped_print(f"Schema URL: {schema_url}")
 
     # Download the schema
-    print("Downloading schema...")
+    timestamped_print("Downloading schema...")
     try:
         with urllib.request.urlopen(schema_url, timeout=30) as response:
             schema_data = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as e:
-        print(f"ERROR: Failed to download schema: {e}", file=sys.stderr)
+        timestamped_print(f"ERROR: Failed to download schema: {e}", file=sys.stderr)
         return 1
     except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON in schema: {e}", file=sys.stderr)
+        timestamped_print(f"ERROR: Invalid JSON in schema: {e}", file=sys.stderr)
         return 1
 
-    print("Schema downloaded successfully")
+    timestamped_print("Schema downloaded successfully")
 
     # Try to import jsonschema for validation
     try:
         import jsonschema
         from jsonschema import Draft7Validator, ValidationError
     except ImportError:
-        print(
+        timestamped_print(
             "WARNING: jsonschema not installed, performing basic structural validation only",
             file=sys.stderr,
         )
         return validate_basic(server_data)
 
     # Validate against schema
-    print("Validating against schema...")
+    timestamped_print("Validating against schema...")
     validator = Draft7Validator(schema_data)
     errors = list(validator.iter_errors(server_data))
 
     if errors:
-        print(f"\nERROR: Schema validation failed with {len(errors)} error(s):\n", file=sys.stderr)
+        timestamped_print(f"ERROR: Schema validation failed with {len(errors)} error(s):", file=sys.stderr)
         for i, error in enumerate(errors, 1):
             path = " -> ".join(str(p) for p in error.absolute_path) or "(root)"
-            print(f"  {i}. Path: {path}", file=sys.stderr)
-            print(f"     Message: {error.message}", file=sys.stderr)
-            print(file=sys.stderr)
+            timestamped_print(f"  {i}. Path: {path}", file=sys.stderr)
+            timestamped_print(f"     Message: {error.message}", file=sys.stderr)
+            timestamped_print(file=sys.stderr)
         return 1
 
-    print("\n[OK] server.json is valid against the MCP server schema")
+    timestamped_print("[OK] server.json is valid against the MCP server schema")
     return 0
 
 
@@ -132,13 +138,13 @@ def validate_basic(server_data: dict) -> int:
                     errors.append(f"Package {i} with streamable-http transport requires 'url' field")
 
     if errors:
-        print(f"\nERROR: Basic validation failed with {len(errors)} error(s):\n", file=sys.stderr)
+        timestamped_print(f"ERROR: Basic validation failed with {len(errors)} error(s):", file=sys.stderr)
         for i, error in enumerate(errors, 1):
-            print(f"  {i}. {error}", file=sys.stderr)
+            timestamped_print(f"  {i}. {error}", file=sys.stderr)
         return 1
 
-    print("\n[OK] server.json passes basic structural validation")
-    print("  (Install 'jsonschema' for full schema validation)")
+    timestamped_print("[OK] server.json passes basic structural validation")
+    timestamped_print("  (Install 'jsonschema' for full schema validation)")
     return 0
 
 

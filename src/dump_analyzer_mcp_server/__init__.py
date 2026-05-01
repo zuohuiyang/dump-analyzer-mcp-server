@@ -1,4 +1,6 @@
-from .server import serve_http
+import logging
+
+from .server import configure_logging, serve_http
 
 def main():
     """Dump Analyzer MCP server entry point."""
@@ -54,6 +56,7 @@ def main():
     )
 
     args = parser.parse_args()
+    configure_logging(logging.INFO if args.verbose else logging.WARNING)
 
     asyncio.run(serve_http(
         host=args.host,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import count
 from typing import Any
 from urllib import error, request
@@ -175,7 +176,7 @@ class MCPHTTPClient:
                             progress = self._normalize_progress_event(method, event.get("params"))
                             if progress is not None:
                                 progress_events.append(progress)
-                                # 实时逐条刷屏
+                                # Stream progress updates line by line in real time.
                                 self._trace("progress", progress)
                             return
                         if "id" in event and ("result" in event or "error" in event):
@@ -313,11 +314,16 @@ class MCPHTTPClient:
                     parsed_message = loaded
             except json.JSONDecodeError:
                 parsed_message = {"message": message}
-        return {
+        normalized = {
             "phase": parsed_message.get("phase", "running"),
-            "message": parsed_message.get("message", message or ""),
-            "percent": parsed_message.get("percent", params.get("progress")),
+            "event": parsed_message.get("event", "output"),
         }
+        normalized_message = parsed_message.get("message")
+        if normalized_message is None and isinstance(message, str) and message and not parsed_message:
+            normalized_message = message
+        if normalized_message is not None:
+            normalized["message"] = normalized_message
+        return normalized
 
     def _record_exchange(
         self,
@@ -342,10 +348,11 @@ class MCPHTTPClient:
     def _trace(self, stage: str, payload: dict[str, Any]) -> None:
         if not self.trace_enabled:
             return
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         encoded = json.dumps(payload, ensure_ascii=False)
         if self.trace_max_chars and len(encoded) > self.trace_max_chars:
             encoded = encoded[: self.trace_max_chars] + "...<truncated>"
-        print(f"[e2e-mcp][{stage}] {encoded}")
+        print(f"[{timestamp}] [e2e-mcp][{stage}] {encoded}")
 
     @staticmethod
     def _read_bool_env(name: str, default: bool) -> bool:

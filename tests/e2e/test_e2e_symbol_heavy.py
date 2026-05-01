@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 import pytest
 
@@ -17,11 +18,16 @@ from tests.e2e.config import E2EConfig
 pytestmark = [pytest.mark.e2e, pytest.mark.e2e_symbol_heavy]
 
 
+def _timestamped_print(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {message}")
+
+
 def _require_symbol_heavy_asset(config: E2EConfig) -> bytes:
     if config.symbol_heavy_dump_path is None:
-        pytest.fail("缺少 symbol_heavy dump 路径，symbol_heavy 场景不允许 skip")
+        pytest.fail("Missing symbol_heavy dump path; the symbol_heavy scenario must not be skipped")
     if not config.symbol_heavy_dump_path.exists():
-        pytest.fail(f"重符号场景 dump 不存在: {config.symbol_heavy_dump_path}")
+        pytest.fail(f"Symbol-heavy scenario dump does not exist: {config.symbol_heavy_dump_path}")
     return config.symbol_heavy_dump_path.read_bytes()
 
 
@@ -53,7 +59,7 @@ def _prepare_and_start(client: MCPHTTPClient, config: E2EConfig, dump_payload: b
 
 
 def _execute(client: MCPHTTPClient, session_id: str, command: str, timeout: int) -> dict:
-    print(f"[symbol_heavy] run command: {command}")
+    _timestamped_print(f"[symbol_heavy] run command: {command}")
     arguments = {"session_id": session_id, "command": command, "timeout": timeout}
     result = client.call_tool("execute_windbg_command", arguments)
     is_error, payload = parse_tool_text_payload(result)
@@ -69,14 +75,14 @@ def _execute(client: MCPHTTPClient, session_id: str, command: str, timeout: int)
     assert is_error is False
     assert isinstance(payload, dict)
     assert payload["success"] is True
-    print(f"[symbol_heavy] done command: {command}, cost_ms={payload.get('execution_time_ms')}")
+    _timestamped_print(f"[symbol_heavy] done command: {command}, cost_ms={payload.get('execution_time_ms')}")
     return payload
 
 
 def _execute_with_progress(
     client: MCPHTTPClient, session_id: str, command: str, timeout: int
 ) -> tuple[dict, list[dict]]:
-    print(f"[symbol_heavy] run command (stream): {command}")
+    _timestamped_print(f"[symbol_heavy] run command (stream): {command}")
     arguments = {"session_id": session_id, "command": command, "timeout": timeout}
     result, progress_events = client.call_tool_with_progress("execute_windbg_command", arguments)
     is_error, payload = parse_tool_text_payload(result)
@@ -93,7 +99,7 @@ def _execute_with_progress(
     assert is_error is False
     assert isinstance(payload, dict)
     assert payload["success"] is True
-    print(
+    _timestamped_print(
         f"[symbol_heavy] done command (stream): {command}, cost_ms={payload.get('execution_time_ms')}, "
         f"progress_events={len(progress_events)}"
     )
@@ -113,9 +119,14 @@ def test_e2e_symbol_heavy_cold_cache(mcp_client: MCPHTTPClient, e2e_config: E2EC
         kv_result = _execute(mcp_client, session_id, ".ecxr;kv", timeout=e2e_config.timeout_seconds)
 
         assert reload_result["execution_time_ms"] >= 0
-        progress_text = "\n".join(str(e.get("message", "")) for e in reload_progress)
+        progress_text = "\n".join(
+            str(e.get("message", ""))
+            for e in reload_progress
+            if str(e.get("event", "")).lower() != "heartbeat" and "message" in e
+        )
         assert any(str(e.get("phase", "")).lower() == "running" for e in reload_progress)
         assert any(str(e.get("phase", "")).lower() == "completed" for e in reload_progress)
+        assert any(str(e.get("event", "")).lower() == "output" for e in reload_progress)
         assert any(token in progress_text.upper() for token in ("SYMSRV", "DBGHELP", "PDB", "SYMBOL"))
         assert module_result["output"]
         assert "electron" in module_result["output"].lower()
@@ -123,10 +134,10 @@ def test_e2e_symbol_heavy_cold_cache(mcp_client: MCPHTTPClient, e2e_config: E2EC
         stack_output = kv_result["output"]
         assert stack_output
 
-        # 1) 必须看到 electron 模块符号（等价于 PDB 解析到函数名）
+        # 1) The electron module symbol must be visible, which implies PDB symbol resolution reached function names.
         assert "electron!electron::ElectronBindings::Crash" in stack_output
 
-        # 2) 首个有效栈帧必须命中 ElectronBindings::Crash
+        # 2) The first valid stack frame must resolve to ElectronBindings::Crash.
         lines = stack_output.splitlines()
         stack_text_index = next(
             (
@@ -148,7 +159,7 @@ def test_e2e_symbol_heavy_cold_cache(mcp_client: MCPHTTPClient, e2e_config: E2EC
             )
 
         assert "electron!electron::ElectronBindings::Crash" in frame0_line
-        print(f"[symbol_heavy] frame0={frame0_line}")
+        _timestamped_print(f"[symbol_heavy] frame0={frame0_line}")
 
     finally:
         mcp_client.call_tool("close_analysis_session", {"session_id": session_id})
@@ -163,7 +174,7 @@ def test_e2e_symbol_heavy_warm_cache(mcp_client: MCPHTTPClient, e2e_config: E2EC
 
         first_ms = int(first["execution_time_ms"])
         second_ms = int(second["execution_time_ms"])
-        # 热缓存通常更快；允许一定波动，避免环境噪声导致误报。
+        # Warm cache is usually faster; allow some variance to avoid false positives from environment noise.
         assert second_ms <= int(first_ms * 1.5)
     finally:
         mcp_client.call_tool("close_analysis_session", {"session_id": session_id})

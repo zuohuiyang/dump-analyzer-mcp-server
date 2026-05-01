@@ -23,7 +23,9 @@ def e2e_config() -> E2EConfig:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    skip_remote = pytest.mark.skip(reason="远端 E2E 未启用：请先设置 DUMP_E2E_BASE_URL 并启动目标服务")
+    skip_remote = pytest.mark.skip(
+        reason="Remote E2E is not enabled: set DUMP_E2E_BASE_URL and start the target service first"
+    )
     for item in items:
         if "tests/e2e/" in str(item.fspath).replace("\\", "/"):
             item.add_marker(pytest.mark.e2e_remote)
@@ -50,7 +52,7 @@ def _wait_until_ready(base_url: str, timeout_seconds: int) -> None:
 @pytest.fixture(scope="session", autouse=True)
 def verify_remote_server_ready(e2e_config: E2EConfig) -> Iterator[None]:
     if not e2e_config.remote_server_configured:
-        pytest.skip("远端 E2E 未启用：请先设置 DUMP_E2E_BASE_URL 并启动目标服务")
+        pytest.skip("Remote E2E is not enabled: set DUMP_E2E_BASE_URL and start the target service first")
     _wait_until_ready(e2e_config.base_url, timeout_seconds=30)
     yield
 

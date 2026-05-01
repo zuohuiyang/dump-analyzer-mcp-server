@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Optional
 
 COMMAND_MARKER_TEXT = "COMMAND_COMPLETED_MARKER"
@@ -27,7 +28,13 @@ DEFAULT_CDB_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbARM64.exe")
 ]
 
-class CDBError(Exception):
+
+def _timestamped_print(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {message}")
+
+
+
     """Custom exception for CDB-related errors"""
     pass
 
@@ -184,19 +191,19 @@ class CDBSession:
                     line = buffer.decode("utf-8", errors="replace")
                     buffer.clear()
                     if self.verbose:
-                        print(f"CDB > {line}")
+                        _timestamped_print(f"CDB > {line}")
                     self._emit_line(line)
                     continue
 
                 buffer.extend(chunk)
         except (IOError, ValueError) as e:
             if self.verbose:
-                print(f"CDB output reader error: {e}")
+                _timestamped_print(f"CDB output reader error: {e}")
         finally:
             if buffer:
                 line = buffer.decode("utf-8", errors="replace")
                 if self.verbose:
-                    print(f"CDB > {line}")
+                    _timestamped_print(f"CDB > {line}")
                 self._emit_line(line)
 
     def send_command(self, command: str, timeout: Optional[int] = None) -> list[str]:
@@ -333,7 +340,7 @@ class CDBSession:
                     self.process.wait(timeout=3)
         except Exception as e:
             if self.verbose:
-                print(f"Error during shutdown: {e}")
+                _timestamped_print(f"Error during shutdown: {e}")
         finally:
             self.process = None
 

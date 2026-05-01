@@ -1,11 +1,13 @@
 import asyncio
 import atexit
+import copy
 import errno
 import json
 import logging
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -60,6 +62,37 @@ _running_requests: dict[str, threading.Event] = {}
 _running_lock = threading.Lock()
 
 
+def configure_logging(level: int = logging.INFO) -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+
+def timestamped_print(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {message}")
+
+
+def build_uvicorn_log_config() -> dict:
+    from uvicorn.config import LOGGING_CONFIG
+
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    default_formatter = log_config.get("formatters", {}).get("default")
+    if isinstance(default_formatter, dict):
+        default_formatter["fmt"] = "%(asctime)s.%(msecs)03d %(levelprefix)s %(message)s"
+        default_formatter["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    access_formatter = log_config.get("formatters", {}).get("access")
+    if isinstance(access_formatter, dict):
+        access_formatter["fmt"] = (
+            '%(asctime)s.%(msecs)03d %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+        )
+        access_formatter["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    return log_config
+
+
 class UploadWorkflowError(RuntimeError):
     def __init__(
         self,
@@ -89,8 +122,8 @@ class UploadWorkflowError(RuntimeError):
 
 
 class PrepareDumpUploadParams(BaseModel):
-    file_size: int = Field(description="文件大小(字节)")
-    file_name: str = Field(description="原始文件名")
+    file_size: int = Field(description="File size in bytes")
+    file_name: str = Field(description="Original file name")
 
     @model_validator(mode="after")
     def validate_payload(self):
@@ -102,13 +135,13 @@ class PrepareDumpUploadParams(BaseModel):
 
 
 class StartAnalysisSessionParams(BaseModel):
-    file_id: str = Field(description="上传成功后返回的文件ID")
+    file_id: str = Field(description="File ID returned after a successful upload")
 
 
 class ExecuteWindbgCommandParams(BaseModel):
-    session_id: str = Field(description="分析会话ID")
-    command: str = Field(description="要执行的CDB命令")
-    timeout: int = Field(default=600, description="命令空闲超时时间(秒，无输出时生效)")
+    session_id: str = Field(description="Analysis session ID")
+    command: str = Field(description="CDB command to execute")
+    timeout: int = Field(default=600, description="Idle timeout in seconds, applied when there is no output")
 
     @model_validator(mode="after")
     def validate_timeout(self):
@@ -118,7 +151,7 @@ class ExecuteWindbgCommandParams(BaseModel):
 
 
 class CloseAnalysisSessionParams(BaseModel):
-    session_id: str = Field(description="会话ID")
+    session_id: str = Field(description="Session ID")
 
 
 async def upload_session_cleanup_loop(interval_seconds: int = DEFAULT_UPLOAD_CLEANUP_INTERVAL_SECONDS) -> None:
@@ -202,17 +235,23 @@ def create_upload_session(file_name: str, file_size: int) -> Dict[str, object]:
     return payload
 
 
-async def _send_progress(session, request_id: str, percent: Optional[float], message: str, phase: str) -> None:
+async def _send_progress(
+    session,
+    request_id: str,
+    phase: str,
+    event: str,
+    message: Optional[str] = None,
+) -> None:
     payload = {
         "phase": phase,
-        "message": message,
-        "percent": percent,
+        "event": event,
     }
-    progress_value = 0.0 if percent is None else float(percent)
+    if message is not None:
+        payload["message"] = message
     await session.send_progress_notification(
         progress_token=request_id,
-        progress=progress_value,
-        total=100.0,
+        progress=0.0,
+        total=None,
         message=json.dumps(payload, ensure_ascii=False),
         related_request_id=request_id,
     )
@@ -305,11 +344,17 @@ async def serve_http(
     )
 
     logger.info("Starting %s on %s:%s", SERVER_NAME, host, port)
-    print(f"{SERVER_NAME} running on http://{host}:{port}")
-    print(f"  MCP endpoint: {public_base_url}/mcp")
-    print(f"  Upload base URL: {public_base_url}")
+    timestamped_print(f"{SERVER_NAME} running on http://{host}:{port}")
+    timestamped_print(f"MCP endpoint: {public_base_url}/mcp")
+    timestamped_print(f"Upload base URL: {public_base_url}")
 
-    config = uvicorn.Config(app, host=host, port=port, log_level="info" if verbose else "warning")
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="info" if verbose else "warning",
+        log_config=build_uvicorn_log_config(),
+    )
     server_instance = uvicorn.Server(config)
     await server_instance.serve()
 
@@ -498,31 +543,31 @@ def _create_server(
         return [
             Tool(
                 name="prepare_dump_upload",
-                description="准备上传崩溃转储文件，返回预签名上传地址",
+                description="Prepare a crash dump upload and return a pre-signed upload URL.",
                 inputSchema=PrepareDumpUploadParams.model_json_schema(),
             ),
             Tool(
                 name="start_analysis_session",
-                description="启动崩溃转储分析会话，加载dump文件和符号。此操作可能需要3-10分钟，将实时显示进度。",
+                description="Start a crash dump analysis session and load the dump file and symbols. This may take 3-10 minutes and reports progress in real time.",
                 inputSchema=StartAnalysisSessionParams.model_json_schema(),
             ),
             Tool(
                 name="execute_windbg_command",
-                description="在分析会话中执行任意CDB命令，实时返回原始输出。长耗时命令会自动发送心跳保持连接。",
+                description="Execute any CDB command in an analysis session and stream the raw output. Long-running commands send heartbeats automatically to keep the connection alive.",
                 inputSchema=ExecuteWindbgCommandParams.model_json_schema(),
             ),
             Tool(
                 name="close_analysis_session",
-                description="关闭分析会话，释放所有资源并删除临时文件",
+                description="Close the analysis session, release all resources, and delete temporary files.",
                 inputSchema=CloseAnalysisSessionParams.model_json_schema(),
             ),
         ]
 
-    async def _send_tool_progress(percent: Optional[float], message: str, phase: str) -> None:
+    async def _send_tool_progress(phase: str, message: str) -> None:
         ctx = _try_get_request_context(server)
         if ctx is None:
             return
-        await _send_progress(ctx.session, str(ctx.request_id), percent, message, phase)
+        await _send_progress(ctx.session, str(ctx.request_id), phase, "lifecycle", message)
 
     @server.call_tool()
     async def call_tool(name, arguments: dict) -> list[TextContent]:
@@ -574,7 +619,7 @@ def _create_server(
                                 "DANGEROUS_COMMAND_BLOCKED: "
                                 + json.dumps(
                                     {
-                                        "message": "命令已被安全策略拒绝执行",
+                                        "message": "Command blocked by security policy",
                                         "blocked_token": blocked,
                                         "command": args.command,
                                     }
@@ -609,13 +654,13 @@ def _create_server(
                     with _running_lock:
                         _running_requests[request_id] = cancel_event
 
-                    await _send_tool_progress(0, f"Running command: {args.command}", "queued")
+                    await _send_tool_progress("queued", f"Running command: {args.command}")
 
                     def on_output(line: str) -> None:
                         if ctx is None:
                             return
                         fut = asyncio.run_coroutine_threadsafe(
-                            _send_progress(ctx.session, request_id, None, f"{line}\n", "running"),
+                            _send_progress(ctx.session, request_id, "running", "output", f"{line}\n"),
                             loop,
                         )
                         try:
@@ -627,7 +672,7 @@ def _create_server(
                         if ctx is None:
                             return
                         fut = asyncio.run_coroutine_threadsafe(
-                            _send_progress(ctx.session, request_id, None, "Still processing...", "running"),
+                            _send_progress(ctx.session, request_id, "running", "heartbeat"),
                             loop,
                         )
                         try:
@@ -644,7 +689,7 @@ def _create_server(
                         5.0,
                         cancel_event,
                     )
-                    await _send_tool_progress(100, "Command completed", "completed")
+                    await _send_tool_progress("completed", "Command completed")
                     payload = {
                         "success": True,
                         "command": args.command,
