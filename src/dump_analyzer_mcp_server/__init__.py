@@ -1,3 +1,4 @@
+from .cdb_session import CDBError, resolve_and_validate_cdb_path
 from .logging_utils import (
     DEFAULT_LOG_LEVEL,
     DEFAULT_LOG_MAX_TOTAL_SIZE_MB,
@@ -106,6 +107,10 @@ def main():
     configure_logging(log_config)
 
     try:
+        try:
+            args.cdb_path = resolve_and_validate_cdb_path(args.cdb_path)
+        except CDBError as exc:
+            raise SystemExit(str(exc)) from exc
         asyncio.run(
             serve_http(
                 host=args.host,

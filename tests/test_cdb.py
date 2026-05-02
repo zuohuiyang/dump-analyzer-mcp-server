@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 import dump_analyzer_mcp_server.cdb_session as cdb_session_module
-from dump_analyzer_mcp_server.cdb_session import CDBSession, COMMAND_MARKER_TEXT
+from dump_analyzer_mcp_server.cdb_session import (
+    CDBError,
+    CDBSession,
+    COMMAND_MARKER_TEXT,
+    resolve_and_validate_cdb_path,
+)
 from dump_analyzer_mcp_server.logging_utils import bind_context
 from tests.test_support import has_available_cdb
 
@@ -127,6 +132,29 @@ def test_find_cdb_executable_prefers_custom_path(monkeypatch):
     session = object.__new__(CDBSession)
 
     assert session._find_cdb_executable(r"C:\custom\cdb.exe") == r"C:\custom\cdb.exe"
+
+
+def test_resolve_and_validate_cdb_path_accepts_supported_sdk(monkeypatch):
+    monkeypatch.setattr(cdb_session_module.os.path, "isfile", lambda path: path == r"C:\custom\cdb.exe")
+    monkeypatch.setattr(cdb_session_module, "get_cdb_windows_sdk_build", lambda _path: 26100)
+
+    assert resolve_and_validate_cdb_path(r"C:\custom\cdb.exe") == r"C:\custom\cdb.exe"
+
+
+def test_resolve_and_validate_cdb_path_rejects_old_sdk(monkeypatch):
+    monkeypatch.setattr(cdb_session_module.os.path, "isfile", lambda path: path == r"C:\custom\cdb.exe")
+    monkeypatch.setattr(cdb_session_module, "get_cdb_windows_sdk_build", lambda _path: 26099)
+
+    with pytest.raises(CDBError, match="detected build 26099"):
+        resolve_and_validate_cdb_path(r"C:\custom\cdb.exe")
+
+
+def test_resolve_and_validate_cdb_path_rejects_unknown_sdk_version(monkeypatch):
+    monkeypatch.setattr(cdb_session_module.os.path, "isfile", lambda path: path == r"C:\custom\cdb.exe")
+    monkeypatch.setattr(cdb_session_module, "get_cdb_windows_sdk_build", lambda _path: None)
+
+    with pytest.raises(CDBError, match="Could not determine the Windows SDK version"):
+        resolve_and_validate_cdb_path(r"C:\custom\cdb.exe")
 
 
 def test_execute_command_heartbeat_callback_invoked():

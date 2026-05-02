@@ -4,7 +4,9 @@ import queue
 import subprocess
 import threading
 import time
+import ctypes
 from dataclasses import dataclass, field
+from ctypes import wintypes
 from typing import Callable, Optional
 
 from .logging_utils import (
@@ -21,6 +23,7 @@ logger = logging.getLogger(__name__)
 COMMAND_MARKER_TEXT = "COMMAND_COMPLETED_MARKER"
 COMMAND_MARKER = f".echo {COMMAND_MARKER_TEXT}"
 MAX_COMMAND_WALL_TIME_HARD_LIMIT_SECONDS = 6 * 60 * 60
+MIN_SUPPORTED_WINDOWS_SDK_BUILD = 26100
 
 DEFAULT_CDB_PATHS = [
     r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe",
@@ -31,6 +34,97 @@ DEFAULT_CDB_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbX86.exe"),
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbARM64.exe"),
 ]
+
+
+class VS_FIXEDFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSignature", wintypes.DWORD),
+        ("dwStrucVersion", wintypes.DWORD),
+        ("dwFileVersionMS", wintypes.DWORD),
+        ("dwFileVersionLS", wintypes.DWORD),
+        ("dwProductVersionMS", wintypes.DWORD),
+        ("dwProductVersionLS", wintypes.DWORD),
+        ("dwFileFlagsMask", wintypes.DWORD),
+        ("dwFileFlags", wintypes.DWORD),
+        ("dwFileOS", wintypes.DWORD),
+        ("dwFileType", wintypes.DWORD),
+        ("dwFileSubtype", wintypes.DWORD),
+        ("dwFileDateMS", wintypes.DWORD),
+        ("dwFileDateLS", wintypes.DWORD),
+    ]
+
+
+def resolve_cdb_executable(custom_path: Optional[str] = None) -> Optional[str]:
+    if custom_path and os.path.isfile(custom_path):
+        return custom_path
+    for path in DEFAULT_CDB_PATHS:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def get_binary_file_version(path: str) -> Optional[tuple[int, int, int, int]]:
+    try:
+        ignored = wintypes.DWORD()
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(path, ctypes.byref(ignored))
+        if size <= 0:
+            return None
+
+        buffer = ctypes.create_string_buffer(size)
+        success = ctypes.windll.version.GetFileVersionInfoW(path, 0, size, buffer)
+        if not success:
+            return None
+
+        version_ptr = ctypes.c_void_p()
+        version_len = wintypes.UINT()
+        success = ctypes.windll.version.VerQueryValueW(
+            buffer,
+            "\\",
+            ctypes.byref(version_ptr),
+            ctypes.byref(version_len),
+        )
+        if not success or version_len.value == 0:
+            return None
+
+        fixed_info = ctypes.cast(version_ptr, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+    except (AttributeError, OSError, ValueError):
+        return None
+
+    return (
+        (fixed_info.dwFileVersionMS >> 16) & 0xFFFF,
+        fixed_info.dwFileVersionMS & 0xFFFF,
+        (fixed_info.dwFileVersionLS >> 16) & 0xFFFF,
+        fixed_info.dwFileVersionLS & 0xFFFF,
+    )
+
+
+def get_cdb_windows_sdk_build(cdb_path: str) -> Optional[int]:
+    version = get_binary_file_version(cdb_path)
+    if version is None:
+        return None
+    return version[2]
+
+
+def resolve_and_validate_cdb_path(
+    custom_path: Optional[str] = None,
+    *,
+    min_sdk_build: int = MIN_SUPPORTED_WINDOWS_SDK_BUILD,
+) -> str:
+    cdb_path = resolve_cdb_executable(custom_path)
+    if not cdb_path:
+        raise CDBError("Could not find cdb.exe. Please provide a valid path.")
+
+    sdk_build = get_cdb_windows_sdk_build(cdb_path)
+    if sdk_build is None:
+        raise CDBError(
+            f"Could not determine the Windows SDK version of cdb.exe: {cdb_path}"
+        )
+    if sdk_build < min_sdk_build:
+        raise CDBError(
+            "Unsupported Windows SDK version for cdb.exe: "
+            f"detected build {sdk_build}, but build {min_sdk_build} or newer is required."
+        )
+    return cdb_path
 
 
 class CDBError(Exception):
@@ -153,12 +247,7 @@ class CDBSession:
         return current
 
     def _find_cdb_executable(self, custom_path: Optional[str] = None) -> Optional[str]:
-        if custom_path and os.path.isfile(custom_path):
-            return custom_path
-        for path in DEFAULT_CDB_PATHS:
-            if os.path.isfile(path):
-                return path
-        return None
+        return resolve_cdb_executable(custom_path)
 
     def _next_request_id(self) -> str:
         with self._state_lock:

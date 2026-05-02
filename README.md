@@ -18,7 +18,7 @@
 
 - 操作系统：Windows
 - Python：3.10 及以上
-- 调试器：建议使用 Windows SDK `26100` 及以上版本（含 WinDbg/CDB），且服务端可访问 `cdb.exe`
+- 调试器：要求使用 [Windows SDK `26100`](https://go.microsoft.com/fwlink/?linkid=2358390) 及以上版本（含 WinDbg/CDB）
 - 网络：客户端可访问 `--public-base-url` 对应地址
 
 ## 安全边界
@@ -72,26 +72,27 @@ uv run dump-analyzer-mcp-server --host 0.0.0.0 --port 8000 --public-base-url htt
 
 ## 命令行参数
 
-| 参数 | 必填 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--host` | 否 | `127.0.0.1` | 服务监听地址 |
-| `--port` | 否 | `8000` | 服务监听端口 |
-| `--public-base-url` | 是 | 无 | 返回给客户端的可访问基址 |
-| `--cdb-path` | 否 | 自动探测 | `cdb.exe` 路径 |
-| `--symbols-path` | 否 | `srv*c:\symbols*https://msdl.microsoft.com/download/symbols` | 服务端符号路径 |
-| `--timeout` | 否 | `1800` | 命令执行超时（秒） |
-| `--upload-dir` | 否 | 系统默认目录 | 上传临时目录 |
-| `--max-upload-mb` | 否 | `100` | 最大上传大小（MB） |
-| `--session-ttl-seconds` | 否 | `1800` | 空闲会话 TTL（秒） |
-| `--max-active-sessions` | 否 | `10` | 最大活跃会话数 |
-| `--log-dir` | 否 | `PROGRAMDATA\dump-analyzer-mcp-server\logs` 或系统临时目录回退 | 服务器日志目录 |
-| `--log-level` | 否 | `INFO` | 基础日志级别 |
-| `--log-retention-days` | 否 | `14` | 按天轮转日志的保留份数 |
-| `--log-max-total-size-mb` | 否 | `2048` | 日志目录总大小上限（MB），超出后删除最老轮转日志 |
-| `--log-keep-console` / `--no-log-keep-console` | 否 | `true` | 是否同时输出到控制台 |
-| `--verbose` | 否 | `false` | 输出详细日志 |
+| 参数                                             | 必填 | 默认值                                                          | 说明                        |
+| ---------------------------------------------- | -- | ------------------------------------------------------------ | ------------------------- |
+| `--host`                                       | 否  | `127.0.0.1`                                                  | 服务监听地址                    |
+| `--port`                                       | 否  | `8000`                                                       | 服务监听端口                    |
+| `--public-base-url`                            | 是  | 无                                                            | 返回给客户端的可访问基址              |
+| `--cdb-path`                                   | 否  | 自动探测                                                         | `cdb.exe` 路径              |
+| `--symbols-path`                               | 否  | `srv*c:\symbols*https://msdl.microsoft.com/download/symbols` | 服务端符号路径                   |
+| `--timeout`                                    | 否  | `1800`                                                       | 命令执行超时（秒）                 |
+| `--upload-dir`                                 | 否  | 系统默认目录                                                       | 上传临时目录                    |
+| `--max-upload-mb`                              | 否  | `100`                                                        | 最大上传大小（MB）                |
+| `--session-ttl-seconds`                        | 否  | `1800`                                                       | 空闲会话 TTL（秒）               |
+| `--max-active-sessions`                        | 否  | `10`                                                         | 最大活跃会话数                   |
+| `--log-dir`                                    | 否  | `PROGRAMDATA\dump-analyzer-mcp-server\logs` 或系统临时目录回退        | 服务器日志目录                   |
+| `--log-level`                                  | 否  | `INFO`                                                       | 基础日志级别                    |
+| `--log-retention-days`                         | 否  | `14`                                                         | 按天轮转日志的保留份数               |
+| `--log-max-total-size-mb`                      | 否  | `2048`                                                       | 日志目录总大小上限（MB），超出后删除最老轮转日志 |
+| `--log-keep-console` / `--no-log-keep-console` | 否  | `true`                                                       | 是否同时输出到控制台                |
+| `--verbose`                                    | 否  | `false`                                                      | 输出详细日志                    |
 
 说明：
+
 - `--public-base-url` 必须是客户端可访问地址，否则 `prepare_dump_upload` 会返回 `UPLOAD_URL_UNAVAILABLE`
 - `--symbols-path` 仅服务端管理员可配置；调用方工具参数不可覆盖符号路径
 - `--verbose` 会将服务日志提升到 `DEBUG`
