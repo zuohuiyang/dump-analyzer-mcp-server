@@ -307,6 +307,44 @@ def test_execute_windbg_command_returns_structured_timeout_result():
     assert payload["queue_wait_ms"] == 0
 
 
+def test_execute_windbg_command_timeout_logs_background_running(caplog, monkeypatch):
+    payload, _metadata = _mark_uploaded_dump("timeout-log.dmp")
+    app_server = server._create_server()
+    monkeypatch.setattr(
+        server,
+        "_try_get_request_context",
+        lambda _server: SimpleNamespace(request_id="req-timeout", session=_FakeRequestSession()),
+    )
+    handler = app_server.request_handlers[CallToolRequest]
+    start_request = CallToolRequest(
+        method="tools/call",
+        params={"name": "start_analysis_session", "arguments": {"file_id": payload["file_id"]}},
+    )
+    start_result = asyncio.run(handler(start_request)).root
+    session_id = json.loads(start_result.content[0].text)["session_id"]
+
+    request = CallToolRequest(
+        method="tools/call",
+        params={
+            "name": "execute_windbg_command",
+            "arguments": {
+                "session_id": session_id,
+                "command": "timeout_no_output",
+            },
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = asyncio.run(handler(request)).root
+
+    assert result.isError is False
+    assert any(
+        getattr(record, "request_id", "") == "req-timeout"
+        and getattr(record, "outcome", "") == "background_running"
+        for record in caplog.records
+    )
+
+
 def test_start_async_windbg_command_returns_command_id():
     payload, _metadata = _mark_uploaded_dump("async-start.dmp")
     app_server = server._create_server()

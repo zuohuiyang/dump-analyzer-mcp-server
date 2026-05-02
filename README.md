@@ -89,13 +89,12 @@ uv run dump-analyzer-mcp-server --host 0.0.0.0 --port 8000 --public-base-url htt
 | `--log-retention-days` | 否 | `14` | 按天轮转日志的保留份数 |
 | `--log-max-total-size-mb` | 否 | `2048` | 日志目录总大小上限（MB），超出后删除最老轮转日志 |
 | `--log-keep-console` / `--no-log-keep-console` | 否 | `true` | 是否同时输出到控制台 |
-| `--log-output-preview-chars` | 否 | `400` | 单条日志中保留的脱敏输出预览字符数 |
 | `--verbose` | 否 | `false` | 输出详细日志 |
 
 说明：
 - `--public-base-url` 必须是客户端可访问地址，否则 `prepare_dump_upload` 会返回 `UPLOAD_URL_UNAVAILABLE`
 - `--symbols-path` 仅服务端管理员可配置；调用方工具参数不可覆盖符号路径
-- `--verbose` 会将服务日志提升到 `DEBUG`，但文件日志仍遵循默认脱敏与截断策略
+- `--verbose` 会将服务日志提升到 `DEBUG`
 
 ## 日志与审计
 
@@ -104,15 +103,17 @@ uv run dump-analyzer-mcp-server --host 0.0.0.0 --port 8000 --public-base-url htt
 - 日志目录默认总大小上限为 `2GB`；超出后会优先删除最老的轮转日志文件。
 - 默认日志目录优先使用 `PROGRAMDATA\dump-analyzer-mcp-server\logs`；如果不可用，则回退到系统临时目录下的项目专属目录。
 - 日志会尽量串联 `request_id`、`file_id`、`session_id`、客户端地址和命令摘要，方便在多人并发调用时定位问题。
-- 为降低泄露风险，日志默认不会写入完整 dump 路径、完整符号路径，也不会默认落完整 WinDbg 原始输出。
+- 完整逐行 WinDbg/CDB 命令输出会写入同一个 `server.log`，可直接用于排查 `SYMSRV`、`DBGHELP`、`DBGENG`、PE/image 加载和长命令卡住问题。
+- 日志输出按原样记录，不做脱敏。
 - 危险命令拦截会记录审计事件，但日志中只保留屏蔽后的命令摘要，不记录完整危险命令文本。
 - 单文件切卷阈值当前不提供 CLI 配置，固定为 `100MB`。
 
 排障建议：
 
 - 生产环境先保持默认日志配置，仅在需要深度排障时临时开启 `--verbose`
-- 优先按 `request_id` / `session_id` 检索同一次分析链路
+- 优先按 `request_id` / `session_id` / `command_id` 检索同一次分析链路
 - 若担心控制台被额外收集，可使用 `--no-log-keep-console` 仅保留文件日志
+- 由于完整 transcript 默认写入，重符号场景下日志增长会明显快于旧版本
 
 ## 错误处理
 

@@ -3,13 +3,16 @@ from pathlib import Path
 
 import pytest
 
+from dump_analyzer_mcp_server.cdb_session import CDBSession, COMMAND_MARKER_TEXT
 from dump_analyzer_mcp_server.logging_utils import (
     CappedTimedRotatingFileHandler,
     DEFAULT_LOG_MAX_FILE_SIZE_MB,
     LOG_FILE_NAME,
+    configure_logging,
     create_logging_runtime_config,
     get_log_dir_total_size_bytes,
     prune_log_dir_to_size_limit,
+    shutdown_logging,
 )
 
 
@@ -122,3 +125,50 @@ def test_active_log_rollover_uses_hardcoded_single_file_limit(tmp_path: Path):
     assert archived
     assert active.exists()
     assert active.stat().st_size == 0
+
+
+def test_server_log_captures_full_cdb_transcript_without_marker(tmp_path: Path):
+    def write_handler(session, _payload: bytes) -> None:
+        session._emit_line("A" * 450)
+        session._emit_line(COMMAND_MARKER_TEXT)
+
+    session = object.__new__(CDBSession)
+    session.timeout = 1
+    session.verbose = False
+    session.log_context = {"file_id": "file-1", "session_id": "session-1"}
+    session.logger = logging.getLogger("dump_analyzer_mcp_server.cdb_session")
+    session._state_lock = __import__("threading").Lock()
+    session._request_counter = 0
+    session._symbol_diagnostics_enabled = False
+    session._active_job = None
+    session._jobs = {}
+    session._job_queue = __import__("queue").Queue()
+    session._shutdown_event = __import__("threading").Event()
+    session.process = type(
+        "_Process",
+        (),
+        {
+            "stdin": type(
+                "_Stdin",
+                (),
+                {"write": lambda _self, payload: write_handler(session, payload), "flush": lambda _self: None},
+            )(),
+            "poll": lambda _self: None,
+        },
+    )()
+    session._worker_thread = __import__("threading").Thread(target=session._worker_loop, daemon=True)
+
+    config = create_logging_runtime_config(log_dir=str(tmp_path), log_keep_console=False)
+    configure_logging(config)
+    try:
+        session._worker_thread.start()
+        result = session.execute_command("kb", timeout=1)
+    finally:
+        session._shutdown_event.set()
+        shutdown_logging()
+
+    assert result["status"] == "completed"
+    content = (tmp_path / LOG_FILE_NAME).read_text(encoding="utf-8")
+    assert "A" * 450 in content
+    assert "<truncated>" not in content
+    assert COMMAND_MARKER_TEXT not in content

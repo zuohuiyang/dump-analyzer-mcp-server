@@ -7,7 +7,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .logging_utils import bind_context, make_context, sanitize_command, sanitize_exception_message, sanitize_output_text, sanitize_path
+from .logging_utils import (
+    bind_context,
+    make_context,
+    normalize_output_line_for_log,
+    sanitize_command,
+    sanitize_exception_message,
+    sanitize_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +222,21 @@ class CDBSession:
         with self._state_lock:
             self._jobs[job.job_id] = job
         self._job_queue.put(job)
+        self._ensure_logger().info(
+            "Queued CDB command",
+            extra=make_context(
+                event="cdb.command",
+                outcome="queued",
+                request_id=job.job_id,
+                command_preview=sanitize_command(job.command),
+            ),
+        )
         return job
 
     def _emit_line(self, text: str) -> None:
+        session_logger = self._ensure_logger()
+        log_message = None
+        log_context = None
         with self._state_lock:
             job = self._active_job
             if job is None:
@@ -227,12 +246,38 @@ class CDBSession:
                     job.status = "completed"
                 job.completed_at = time.time()
                 job.completed_event.set()
-                return
-            now = time.time()
-            if job.first_output_at is None:
-                job.first_output_at = now
-            job.last_output_at = now
-            job.output_lines.append(text)
+                log_message = "Detected command completion marker"
+                log_context = make_context(
+                    event="cdb.command",
+                    outcome="marker_detected",
+                    request_id=job.job_id,
+                    command_preview=sanitize_command(job.command),
+                )
+            else:
+                now = time.time()
+                first_output = job.first_output_at is None
+                if first_output:
+                    job.first_output_at = now
+                    session_logger.info(
+                        "First output received for CDB command",
+                        extra=make_context(
+                            event="cdb.command",
+                            outcome="first_output",
+                            request_id=job.job_id,
+                            command_preview=sanitize_command(job.command),
+                        ),
+                    )
+                job.last_output_at = now
+                job.output_lines.append(text)
+                log_message = normalize_output_line_for_log(text)
+                log_context = make_context(
+                    event="cdb.output",
+                    outcome="line",
+                    request_id=job.job_id,
+                    command_preview=sanitize_command(job.command),
+                )
+        if log_message is not None and log_context is not None:
+            session_logger.info(log_message, extra=log_context)
 
     def _read_output_bytes(self) -> None:
         if not self.process or not self.process.stdout:
@@ -253,12 +298,6 @@ class CDBSession:
                         skip_next_lf = True
                     line = buffer.decode("utf-8", errors="replace")
                     buffer.clear()
-                    if self.verbose:
-                        self.logger.debug(
-                            "CDB output preview: %s",
-                            sanitize_output_text(line),
-                            extra=make_context(event="cdb.output", outcome="streaming"),
-                        )
                     self._emit_line(line)
                     continue
                 buffer.extend(chunk)
@@ -412,6 +451,15 @@ class CDBSession:
                 return self._build_job_result(job, override_status="cancelled", cancelled=True)
 
             if wait_timeout > 0 and (time.time() - wait_started_at) >= wait_timeout:
+                self._ensure_logger().warning(
+                    "Foreground wait timed out; command continues in background",
+                    extra=make_context(
+                        event="cdb.command",
+                        outcome="timeout",
+                        request_id=job.job_id,
+                        command_preview=sanitize_command(job.command),
+                    ),
+                )
                 return self._build_job_result(job, override_status="timeout", timed_out=True)
 
             if on_heartbeat and heartbeat_interval > 0 and (time.time() - last_heartbeat_at) >= heartbeat_interval:

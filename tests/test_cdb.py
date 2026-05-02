@@ -1,4 +1,3 @@
-import io
 import logging
 import os
 import queue
@@ -180,6 +179,34 @@ def test_execute_command_timeout_returns_while_background_job_keeps_running():
     session._shutdown_event.set()
 
 
+def test_execute_command_timeout_logs_background_continuation(caplog):
+    allow_completion = threading.Event()
+
+    def write_handler(session, _payload: bytes) -> None:
+        def _complete_later():
+            allow_completion.wait(timeout=1)
+            session._emit_line("late-line")
+            session._emit_line(COMMAND_MARKER_TEXT)
+
+        threading.Thread(target=_complete_later, daemon=True).start()
+
+    session = _build_fake_session(write_handler)
+
+    with caplog.at_level(logging.INFO, logger="dump_analyzer_mcp_server.cdb_session"):
+        result = session.execute_command("kb", timeout=0.05)
+        allow_completion.set()
+        session.wait_for_command_result(result["request_id"], wait_timeout=1)
+
+    assert result["status"] == "timeout"
+    assert any(
+        getattr(record, "event", "") == "cdb.command"
+        and getattr(record, "outcome", "") == "timeout"
+        and "Foreground wait timed out; command continues in background" in record.getMessage()
+        for record in caplog.records
+    )
+    session._shutdown_event.set()
+
+
 def test_queued_command_reports_queue_wait_time():
     first_can_finish = threading.Event()
     first_started = threading.Event()
@@ -226,31 +253,6 @@ def test_execute_command_logs_request_context(caplog):
     assert any(getattr(record, "request_id", "") == "1" for record in command_records)
     assert all(getattr(record, "session_id", "") == "session-1" for record in command_records)
     session._shutdown_event.set()
-
-
-def test_verbose_reader_logs_truncated_output(caplog):
-    session = object.__new__(CDBSession)
-    session.process = SimpleNamespace(stdout=io.BytesIO((b"A" * 450) + b"\n"))
-    session.timeout = 1
-    session.verbose = True
-    session._state_lock = threading.Lock()
-    session._active_job = None
-    session._request_counter = 0
-    session.log_context = {"file_id": "file-1", "session_id": "session-1"}
-    session.logger = bind_context(
-        logging.getLogger("dump_analyzer_mcp_server.cdb_session"),
-        event="cdb.session",
-        file_id="file-1",
-        session_id="session-1",
-    )
-    session._shutdown_event = threading.Event()
-
-    with caplog.at_level(logging.DEBUG, logger="dump_analyzer_mcp_server.cdb_session"):
-        session._read_output_bytes()
-
-    messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "<truncated>" in messages
-    assert "A" * 430 not in messages
 
 if __name__ == "__main__":
     pytest.main(["-v", __file__])

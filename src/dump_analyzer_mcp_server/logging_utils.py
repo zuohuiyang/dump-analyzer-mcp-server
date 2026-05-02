@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_LOG_RETENTION_DAYS = 14
-DEFAULT_LOG_OUTPUT_PREVIEW_CHARS = 400
 DEFAULT_LOG_MAX_TOTAL_SIZE_MB = 2048
 DEFAULT_LOG_MAX_FILE_SIZE_MB = 100
 BYTES_PER_MB = 1024 * 1024
@@ -31,7 +30,6 @@ class LoggingRuntimeConfig:
     log_level: str = DEFAULT_LOG_LEVEL
     log_retention_days: int = DEFAULT_LOG_RETENTION_DAYS
     log_keep_console: bool = True
-    log_output_preview_chars: int = DEFAULT_LOG_OUTPUT_PREVIEW_CHARS
     log_max_total_size_mb: int = DEFAULT_LOG_MAX_TOTAL_SIZE_MB
 
     @property
@@ -127,13 +125,10 @@ def create_logging_runtime_config(
     log_level: str = DEFAULT_LOG_LEVEL,
     log_retention_days: int = DEFAULT_LOG_RETENTION_DAYS,
     log_keep_console: bool = True,
-    log_output_preview_chars: int = DEFAULT_LOG_OUTPUT_PREVIEW_CHARS,
     log_max_total_size_mb: int = DEFAULT_LOG_MAX_TOTAL_SIZE_MB,
 ) -> LoggingRuntimeConfig:
     if log_retention_days <= 0:
         raise ValueError("log_retention_days must be greater than 0")
-    if log_output_preview_chars <= 0:
-        raise ValueError("log_output_preview_chars must be greater than 0")
     if log_max_total_size_mb <= 0:
         raise ValueError("log_max_total_size_mb must be greater than 0")
     normalized_level = normalize_log_level(log_level)
@@ -143,7 +138,6 @@ def create_logging_runtime_config(
         log_level=normalized_level,
         log_retention_days=log_retention_days,
         log_keep_console=log_keep_console,
-        log_output_preview_chars=log_output_preview_chars,
         log_max_total_size_mb=log_max_total_size_mb,
     )
 
@@ -200,18 +194,13 @@ def prune_log_dir_to_size_limit(
 def sanitize_path(path: Optional[str]) -> str:
     if not path:
         return "-"
-    name = Path(path).name
-    return name or "<redacted-path>"
+    return str(path)
 
 
 def sanitize_url(url: Optional[str]) -> str:
     if not url:
         return "-"
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return "<redacted-url>"
-    safe_path = parsed.path or "/"
-    return f"{parsed.scheme}://{parsed.netloc}{safe_path}"
+    return str(url)
 
 
 def sanitize_client_addr(client_addr: Optional[str]) -> str:
@@ -230,21 +219,18 @@ def sanitize_command(command: Optional[str], limit: int = DEFAULT_COMMAND_PREVIE
     return f"{normalized[:limit]}...<truncated>"
 
 
-def sanitize_output_text(text: Optional[str], limit: int = DEFAULT_LOG_OUTPUT_PREVIEW_CHARS) -> str:
+def normalize_output_line_for_log(text: Optional[str]) -> str:
     if not text:
         return "-"
-    if limit <= 0 and _active_config is not None:
-        limit = _active_config.log_output_preview_chars
-    elif _active_config is not None and limit == DEFAULT_LOG_OUTPUT_PREVIEW_CHARS:
-        limit = _active_config.log_output_preview_chars
-    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
-    if len(normalized) <= limit:
-        return normalized
-    return f"{normalized[:limit]}...<truncated>"
+    return str(text).replace("\r\n", "\n").replace("\r", "\n")
 
 
-def sanitize_exception_message(text: Optional[str], limit: int = DEFAULT_LOG_OUTPUT_PREVIEW_CHARS) -> str:
-    return sanitize_output_text(text, limit=limit)
+def sanitize_output_text(text: Optional[str]) -> str:
+    return normalize_output_line_for_log(text)
+
+
+def sanitize_exception_message(text: Optional[str]) -> str:
+    return normalize_output_line_for_log(text)
 
 
 def make_context(

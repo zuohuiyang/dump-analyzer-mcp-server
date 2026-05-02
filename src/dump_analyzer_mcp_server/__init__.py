@@ -1,7 +1,6 @@
 from .logging_utils import (
     DEFAULT_LOG_LEVEL,
     DEFAULT_LOG_MAX_TOTAL_SIZE_MB,
-    DEFAULT_LOG_OUTPUT_PREVIEW_CHARS,
     DEFAULT_LOG_RETENTION_DAYS,
     configure_logging,
     create_logging_runtime_config,
@@ -54,15 +53,6 @@ def main():
         help="Keep mirrored logs on the console in addition to log files",
     )
     parser.add_argument(
-        "--log-output-preview-chars",
-        type=int,
-        default=DEFAULT_LOG_OUTPUT_PREVIEW_CHARS,
-        help=(
-            "Maximum number of sanitized output characters to keep in each log preview "
-            f"(default: {DEFAULT_LOG_OUTPUT_PREVIEW_CHARS})"
-        ),
-    )
-    parser.add_argument(
         "--log-max-total-size-mb",
         type=int,
         default=DEFAULT_LOG_MAX_TOTAL_SIZE_MB,
@@ -111,7 +101,6 @@ def main():
         log_level=runtime_log_level,
         log_retention_days=args.log_retention_days,
         log_keep_console=args.log_keep_console,
-        log_output_preview_chars=args.log_output_preview_chars,
         log_max_total_size_mb=args.log_max_total_size_mb,
     )
     configure_logging(log_config)

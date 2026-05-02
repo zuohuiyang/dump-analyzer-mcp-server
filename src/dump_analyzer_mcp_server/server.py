@@ -18,10 +18,10 @@ from pydantic import BaseModel, Field, model_validator
 from .logging_utils import (
     bind_context,
     make_context,
+    normalize_output_line_for_log,
     sanitize_client_addr,
     sanitize_command,
     sanitize_exception_message,
-    sanitize_output_text,
     sanitize_path,
     sanitize_url,
 )
@@ -965,7 +965,7 @@ def _create_server(
                             first_output_logged = True
                             command_logger.info(
                                 "First command output observed: %s",
-                                sanitize_output_text(line),
+                                normalize_output_line_for_log(line),
                                 extra=make_context(
                                     outcome="streaming",
                                     request_id=request_id,
@@ -1026,6 +1026,17 @@ def _create_server(
                             command_preview=command_preview,
                         ),
                     )
+                    if result["status"] == "timeout" and result.get("background_running"):
+                        command_logger.warning(
+                            "Foreground command timed out while background execution continues",
+                            extra=make_context(
+                                outcome="background_running",
+                                request_id=request_id,
+                                file_id=metadata.file_id,
+                                session_id=args.session_id,
+                                command_preview=command_preview,
+                            ),
+                        )
                     payload = {
                         "success": result["status"] == "completed",
                         "status": result["status"],
