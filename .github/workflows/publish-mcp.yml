@@ -30,6 +30,7 @@ jobs:
     needs: build-and-test
     permissions:
       contents: read
+      id-token: write
 
     steps:
     - name: Download build artifacts
@@ -43,16 +44,10 @@ jobs:
         echo "Downloaded artifacts:"
         ls -la dist/
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
-      with:
-        version: "latest"
-        enable-cache: false  # No cache needed for publish-only job
-
     - name: Publish to PyPI
-      run: uv publish --token ${{ secrets.PYPI_API_TOKEN }}
-      env:
-        UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: dist/
 
     - name: Create GitHub Release Summary
       run: |
