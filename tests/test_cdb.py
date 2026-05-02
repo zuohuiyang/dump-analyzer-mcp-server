@@ -1,13 +1,14 @@
 import io
 import logging
 import os
+import queue
 import threading
 import time
 from types import SimpleNamespace
 import pytest
 
 import dump_analyzer_mcp_server.cdb_session as cdb_session_module
-from dump_analyzer_mcp_server.cdb_session import CDBSession
+from dump_analyzer_mcp_server.cdb_session import CDBSession, COMMAND_MARKER_TEXT
 from dump_analyzer_mcp_server.logging_utils import bind_context
 from tests.test_support import has_available_cdb
 
@@ -39,17 +40,35 @@ def test_basic_cdb_command():
         session.shutdown()
 
 
-def test_send_command_serializes_concurrent_calls():
-    """Concurrent callers should not interleave commands on one CDB process."""
+def _build_fake_session(write_handler):
     session = object.__new__(CDBSession)
-    session.process = SimpleNamespace()
     session.timeout = 1
     session.verbose = False
-    session.command_lock = threading.Lock()
+    session.log_context = {"file_id": "file-1", "session_id": "session-1"}
+    session.logger = bind_context(
+        logging.getLogger("dump_analyzer_mcp_server.cdb_session"),
+        event="cdb.session",
+        file_id="file-1",
+        session_id="session-1",
+    )
     session._state_lock = threading.Lock()
-    session._active_execution = None
     session._request_counter = 0
+    session._symbol_diagnostics_enabled = False
+    session._active_job = None
+    session._jobs = {}
+    session._job_queue = queue.Queue()
+    session._shutdown_event = threading.Event()
+    session.process = SimpleNamespace(
+        stdin=SimpleNamespace(write=lambda payload: write_handler(session, payload), flush=lambda: None),
+        poll=lambda: None,
+    )
+    session._worker_thread = threading.Thread(target=session._worker_loop, daemon=True)
+    session._worker_thread.start()
+    return session
 
+
+def test_send_command_serializes_concurrent_calls():
+    """Concurrent callers should not interleave commands on one CDB process."""
     active_writes = 0
     max_active_writes = 0
     state_lock = threading.Lock()
@@ -57,31 +76,27 @@ def test_send_command_serializes_concurrent_calls():
     allow_first_command_to_finish = threading.Event()
     commands_seen = []
 
-    class FakeStdin:
-        def write(self, payload: bytes) -> None:
-            nonlocal active_writes, max_active_writes
-            command = payload.decode("utf-8").splitlines()[0]
-            commands_seen.append(command)
-            with state_lock:
-                active_writes += 1
-                max_active_writes = max(max_active_writes, active_writes)
+    def write_handler(session, payload: bytes) -> None:
+        nonlocal active_writes, max_active_writes
+        command = payload.decode("utf-8").splitlines()[0]
+        commands_seen.append(command)
+        with state_lock:
+            active_writes += 1
+            max_active_writes = max(max_active_writes, active_writes)
 
+        def complete():
             if command == "r":
                 first_command_entered.set()
                 allow_first_command_to_finish.wait(timeout=1)
-
-            execution = session._active_execution
-            execution.output_lines.append(f"out:{command}")
-            execution.completed = True
-            execution.done_event.set()
-
+            session._emit_line(f"out:{command}")
+            session._emit_line(COMMAND_MARKER_TEXT)
             with state_lock:
+                nonlocal active_writes
                 active_writes -= 1
 
-        def flush(self) -> None:
-            return None
+        threading.Thread(target=complete, daemon=True).start()
 
-    session.process.stdin = FakeStdin()
+    session = _build_fake_session(write_handler)
 
     results = {}
 
@@ -104,6 +119,7 @@ def test_send_command_serializes_concurrent_calls():
     assert results["second"] == ["out:kb"]
     assert commands_seen == ["r", "kb"]
     assert max_active_writes == 1
+    session._shutdown_event.set()
 
 
 def test_find_cdb_executable_prefers_custom_path(monkeypatch):
@@ -115,66 +131,35 @@ def test_find_cdb_executable_prefers_custom_path(monkeypatch):
 
 
 def test_execute_command_heartbeat_callback_invoked():
-    session = object.__new__(CDBSession)
-    session.process = SimpleNamespace()
-    session.timeout = 1
-    session.verbose = False
-    session.command_lock = threading.Lock()
-    session._state_lock = threading.Lock()
-    session._active_execution = None
-    session._request_counter = 0
+    def write_handler(session, _payload: bytes) -> None:
+        def _complete_later():
+            time.sleep(0.35)
+            session._emit_line("line")
+            session._emit_line(COMMAND_MARKER_TEXT)
 
-    class FakeStdin:
-        def write(self, payload: bytes) -> None:
-            execution = session._active_execution
-            def _complete_later():
-                # Sleep longer than execute_command queue poll timeout (0.2s)
-                # to make heartbeat callback deterministic.
-                time.sleep(0.35)
-                execution.output_lines.append("line")
-                execution.completed = True
-                execution.done_event.set()
+        threading.Thread(target=_complete_later, daemon=True).start()
 
-            threading.Thread(target=_complete_later, daemon=True).start()
-
-        def flush(self) -> None:
-            return None
-
-    session.process.stdin = FakeStdin()
+    session = _build_fake_session(write_handler)
     heartbeats = []
     result = session.execute_command("kb", timeout=1, on_heartbeat=lambda: heartbeats.append("hb"), heartbeat_interval=0.01)
     assert result["output_lines"] == ["line"]
     assert len(heartbeats) >= 1
+    session._shutdown_event.set()
 
 
-def test_execute_command_timeout_triggers_interrupt_even_with_heartbeats():
-    session = object.__new__(CDBSession)
-    session.process = SimpleNamespace()
-    session.timeout = 1
-    session.verbose = False
-    session.command_lock = threading.Lock()
-    session._state_lock = threading.Lock()
-    session._active_execution = None
-    session._request_counter = 0
+def test_execute_command_timeout_returns_while_background_job_keeps_running():
+    allow_completion = threading.Event()
 
-    class FakeStdin:
-        def write(self, _payload: bytes) -> None:
-            return None
+    def write_handler(session, _payload: bytes) -> None:
+        def _complete_later():
+            allow_completion.wait(timeout=1)
+            session._emit_line("late-line")
+            session._emit_line(COMMAND_MARKER_TEXT)
 
-        def flush(self) -> None:
-            return None
+        threading.Thread(target=_complete_later, daemon=True).start()
 
-    session.process.stdin = FakeStdin()
+    session = _build_fake_session(write_handler)
     heartbeats = []
-    interrupt_calls = []
-
-    def fake_send_ctrl_break():
-        interrupt_calls.append("interrupt")
-        execution = session._active_execution
-        execution.completed = True
-        execution.done_event.set()
-
-    session.send_ctrl_break = fake_send_ctrl_break
 
     result = session.execute_command(
         "kb",
@@ -185,38 +170,52 @@ def test_execute_command_timeout_triggers_interrupt_even_with_heartbeats():
 
     assert result["status"] == "timeout"
     assert result["timed_out"] is True
-    assert interrupt_calls == ["interrupt"]
-    assert len(heartbeats) >= 1
+    assert result["background_running"] is True
+    pending = session.get_pending_command()
+    assert pending is not None
+    allow_completion.set()
+    final_result = session.wait_for_command_result(result["request_id"], wait_timeout=1)
+    assert final_result["status"] == "completed"
+    assert "late-line" in final_result["output_lines"]
+    session._shutdown_event.set()
+
+
+def test_queued_command_reports_queue_wait_time():
+    first_can_finish = threading.Event()
+    first_started = threading.Event()
+
+    def write_handler(session, payload: bytes) -> None:
+        command = payload.decode("utf-8").splitlines()[0]
+
+        def _complete_later():
+            if command == "first":
+                first_started.set()
+                first_can_finish.wait(timeout=1)
+            session._emit_line(f"line:{command}")
+            session._emit_line(COMMAND_MARKER_TEXT)
+
+        threading.Thread(target=_complete_later, daemon=True).start()
+
+    session = _build_fake_session(write_handler)
+    first_job = session.start_async_command("first")
+    assert first_started.wait(timeout=1)
+    second_job = session.start_async_command("second")
+    time.sleep(0.1)
+    first_can_finish.set()
+    result = session.wait_for_command_result(second_job["request_id"], wait_timeout=1)
+    assert result["status"] == "completed"
+    assert result["queue_wait_ms"] is not None
+    assert result["queue_wait_ms"] > 0
+    assert result["execution_time_ms"] >= 0
+    session._shutdown_event.set()
 
 
 def test_execute_command_logs_request_context(caplog):
-    session = object.__new__(CDBSession)
-    session.process = SimpleNamespace()
-    session.timeout = 1
-    session.verbose = False
-    session.command_lock = threading.Lock()
-    session._state_lock = threading.Lock()
-    session._active_execution = None
-    session._request_counter = 0
-    session.log_context = {"file_id": "file-1", "session_id": "session-1"}
-    session.logger = bind_context(
-        logging.getLogger("dump_analyzer_mcp_server.cdb_session"),
-        event="cdb.session",
-        file_id="file-1",
-        session_id="session-1",
-    )
+    def write_handler(session, _payload: bytes) -> None:
+        session._emit_line("out:kb")
+        session._emit_line(COMMAND_MARKER_TEXT)
 
-    class FakeStdin:
-        def write(self, _payload: bytes) -> None:
-            execution = session._active_execution
-            execution.output_lines.append("out:kb")
-            execution.completed = True
-            execution.done_event.set()
-
-        def flush(self) -> None:
-            return None
-
-    session.process.stdin = FakeStdin()
+    session = _build_fake_session(write_handler)
 
     with caplog.at_level(logging.INFO, logger="dump_analyzer_mcp_server.cdb_session"):
         result = session.execute_command("kb", timeout=1)
@@ -226,6 +225,7 @@ def test_execute_command_logs_request_context(caplog):
     assert command_records
     assert any(getattr(record, "request_id", "") == "1" for record in command_records)
     assert all(getattr(record, "session_id", "") == "session-1" for record in command_records)
+    session._shutdown_event.set()
 
 
 def test_verbose_reader_logs_truncated_output(caplog):
@@ -233,9 +233,8 @@ def test_verbose_reader_logs_truncated_output(caplog):
     session.process = SimpleNamespace(stdout=io.BytesIO((b"A" * 450) + b"\n"))
     session.timeout = 1
     session.verbose = True
-    session.command_lock = threading.Lock()
     session._state_lock = threading.Lock()
-    session._active_execution = None
+    session._active_job = None
     session._request_counter = 0
     session.log_context = {"file_id": "file-1", "session_id": "session-1"}
     session.logger = bind_context(
@@ -244,6 +243,7 @@ def test_verbose_reader_logs_truncated_output(caplog):
         file_id="file-1",
         session_id="session-1",
     )
+    session._shutdown_event = threading.Event()
 
     with caplog.at_level(logging.DEBUG, logger="dump_analyzer_mcp_server.cdb_session"):
         session._read_output_bytes()

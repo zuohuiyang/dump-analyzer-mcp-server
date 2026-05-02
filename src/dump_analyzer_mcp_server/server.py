@@ -161,6 +161,31 @@ class ExecuteWindbgCommandParams(BaseModel):
         return self
 
 
+class StartAsyncWindbgCommandParams(BaseModel):
+    session_id: str = Field(description="Analysis session ID")
+    command: str = Field(description="CDB command to execute asynchronously")
+
+
+class GetAsyncWindbgCommandStatusParams(BaseModel):
+    session_id: str = Field(description="Analysis session ID")
+    command_id: str = Field(description="Command ID returned by start_async_windbg_command")
+
+
+class GetAsyncWindbgCommandResultParams(BaseModel):
+    session_id: str = Field(description="Analysis session ID")
+    command_id: str = Field(description="Command ID returned by start_async_windbg_command")
+    wait_timeout: int = Field(
+        default=0,
+        description="Optional wait timeout in seconds. Use 0 to return immediately if the command is still running.",
+    )
+
+    @model_validator(mode="after")
+    def validate_wait_timeout(self):
+        if self.wait_timeout < 0:
+            raise ValueError("wait_timeout must be greater than or equal to 0")
+        return self
+
+
 class CloseAnalysisSessionParams(BaseModel):
     session_id: str = Field(description="Session ID")
 
@@ -322,9 +347,33 @@ def _build_suggested_next_step(result: Dict[str, object]) -> Optional[str]:
         if result.get("first_output_delay_ms") is None:
             return "Retry with a larger timeout or run a lighter command first, such as .lastevent or .ecxr;kv."
         return "Review the partial output, then retry with a larger timeout or continue with a lighter follow-up command."
+    if status in {"busy", "queued"}:
+        running_command = result.get("running_command") or "the previous command"
+        return f"Wait for {running_command} to finish, then retry this command or use the async status/result tools."
     if status == "cancelled":
         return "Retry the command if you still need the full output."
     return None
+
+
+def _build_pending_command_payload(args_command: str, pending: Dict[str, object], status: str) -> Dict[str, object]:
+    payload = {
+        "success": False,
+        "status": status,
+        "command": args_command,
+        "output": "",
+        "execution_time_ms": 0,
+        "cancelled": False,
+        "timed_out": False,
+        "first_output_delay_ms": None,
+        "queue_wait_ms": 0,
+        "running_command_id": pending.get("request_id"),
+        "running_command": pending.get("command"),
+        "running_status": pending.get("status"),
+    }
+    suggested_next_step = _build_suggested_next_step(payload)
+    if suggested_next_step:
+        payload["suggested_next_step"] = suggested_next_step
+    return payload
 
 
 async def _stream_upload_to_file(
@@ -675,11 +724,29 @@ def _create_server(
                 name="execute_windbg_command",
                 description=(
                     "Execute any CDB command in an analysis session and stream the raw output. "
-                    "For hosts without visible streaming progress, prefer .lastevent -> .ecxr;kv -> "
-                    "lmv m <module> before !analyze -v. On timeout, the server returns structured status "
-                    "instead of a tool error."
+                    "Prefer this synchronous tool for lighter commands such as .lastevent, k, and lmv m <module>. "
+                    "Use the async command tools for heavier commands such as .reload /f or !analyze -v. "
+                    "On timeout, the server returns structured status instead of a tool error."
                 ),
                 inputSchema=ExecuteWindbgCommandParams.model_json_schema(),
+            ),
+            Tool(
+                name="start_async_windbg_command",
+                description=(
+                    "Start a CDB command asynchronously and return a command_id. "
+                    "Use this for heavy commands such as .reload /f, .ecxr;kv on a cold symbol cache, or !analyze -v."
+                ),
+                inputSchema=StartAsyncWindbgCommandParams.model_json_schema(),
+            ),
+            Tool(
+                name="get_async_windbg_command_status",
+                description="Get the current status of an asynchronously running CDB command.",
+                inputSchema=GetAsyncWindbgCommandStatusParams.model_json_schema(),
+            ),
+            Tool(
+                name="get_async_windbg_command_result",
+                description="Get the result of an asynchronously running CDB command, optionally waiting a short time.",
+                inputSchema=GetAsyncWindbgCommandResultParams.model_json_schema(),
             ),
             Tool(
                 name="close_analysis_session",
@@ -857,6 +924,20 @@ def _create_server(
                             },
                         ),
                     )
+                    pending = session.get_pending_command()
+                    if pending is not None:
+                        command_logger.info(
+                            "Synchronous command rejected because another command is still running",
+                            extra=make_context(
+                                outcome="busy",
+                                request_id=request_id,
+                                file_id=metadata.file_id,
+                                session_id=args.session_id,
+                                command_preview=command_preview,
+                            ),
+                        )
+                        payload = _build_pending_command_payload(args.command, pending, "busy")
+                        return [TextContent(type="text", text=json.dumps(payload))]
                     ctx = _try_get_request_context(server)
                     request_id = str(ctx.request_id) if ctx is not None else request_id
                     loop = asyncio.get_running_loop()
@@ -954,6 +1035,194 @@ def _create_server(
                         "cancelled": bool(result["cancelled"]),
                         "timed_out": bool(result["timed_out"]),
                         "first_output_delay_ms": result["first_output_delay_ms"],
+                        "queue_wait_ms": result["queue_wait_ms"],
+                    }
+                    suggested_next_step = _build_suggested_next_step(result)
+                    if suggested_next_step:
+                        payload["suggested_next_step"] = suggested_next_step
+                    return [TextContent(type="text", text=json.dumps(payload))]
+                finally:
+                    with _running_lock:
+                        _running_requests.pop(request_id, None)
+                    upload_sessions.release_analysis_session(args.session_id, upload_runtime_config.session_ttl_seconds)
+
+            if name == "start_async_windbg_command":
+                args = StartAsyncWindbgCommandParams(**arguments)
+                command_preview = sanitize_command(args.command)
+                blocked = _validate_dangerous_command(args.command)
+                if blocked:
+                    raise McpError(
+                        ErrorData(
+                            code=INVALID_PARAMS,
+                            message=(
+                                "DANGEROUS_COMMAND_BLOCKED: "
+                                + json.dumps(
+                                    {
+                                        "message": "Command blocked by security policy",
+                                        "blocked_token": blocked,
+                                        "command": args.command,
+                                    }
+                                )
+                            ),
+                        )
+                    )
+                analysis, metadata, error_message = upload_sessions.acquire_analysis_session(
+                    args.session_id, upload_runtime_config.session_ttl_seconds
+                )
+                if analysis is None or metadata is None:
+                    raise McpError(
+                        ErrorData(code=INVALID_PARAMS, message=f"{UPLOAD_ERROR_SESSION_NOT_FOUND}: {error_message}")
+                    )
+                try:
+                    session = upload_sessions.get_or_create_cdb_session(
+                        upload_sessions.build_upload_cdb_session_key(args.session_id),
+                        lambda: CDBSession(
+                            dump_path=metadata.temp_file_path,
+                            cdb_path=cdb_path,
+                            symbols_path=symbols_path or DEFAULT_SYMBOL_PATH,
+                            timeout=timeout,
+                            verbose=verbose,
+                            log_context={
+                                "request_id": base_context["request_id"],
+                                "file_id": metadata.file_id,
+                                "session_id": args.session_id,
+                            },
+                        ),
+                    )
+                    result = session.start_async_command(args.command)
+                    payload = {
+                        "command_id": result["request_id"],
+                        "session_id": args.session_id,
+                        "status": result["status"],
+                        "command": args.command,
+                        "queue_wait_ms": result["queue_wait_ms"],
+                    }
+                    return [TextContent(type="text", text=json.dumps(payload))]
+                finally:
+                    upload_sessions.release_analysis_session(args.session_id, upload_runtime_config.session_ttl_seconds)
+
+            if name == "get_async_windbg_command_status":
+                args = GetAsyncWindbgCommandStatusParams(**arguments)
+                analysis, metadata, error_message = upload_sessions.acquire_analysis_session(
+                    args.session_id, upload_runtime_config.session_ttl_seconds
+                )
+                if analysis is None or metadata is None:
+                    raise McpError(
+                        ErrorData(code=INVALID_PARAMS, message=f"{UPLOAD_ERROR_SESSION_NOT_FOUND}: {error_message}")
+                    )
+                try:
+                    session = upload_sessions.get_or_create_cdb_session(
+                        upload_sessions.build_upload_cdb_session_key(args.session_id),
+                        lambda: CDBSession(
+                            dump_path=metadata.temp_file_path,
+                            cdb_path=cdb_path,
+                            symbols_path=symbols_path or DEFAULT_SYMBOL_PATH,
+                            timeout=timeout,
+                            verbose=verbose,
+                            log_context={
+                                "request_id": base_context["request_id"],
+                                "file_id": metadata.file_id,
+                                "session_id": args.session_id,
+                            },
+                        ),
+                    )
+                    result = session.get_command_status(args.command_id)
+                    payload = {
+                        "command_id": args.command_id,
+                        "session_id": args.session_id,
+                        "status": result["status"],
+                        "command": result["command"],
+                        "queue_wait_ms": result["queue_wait_ms"],
+                        "execution_time_ms": result["execution_time_ms"],
+                        "first_output_delay_ms": result["first_output_delay_ms"],
+                        "output_line_count": result["output_line_count"],
+                        "started": result["started"],
+                        "completed": result["completed"],
+                    }
+                    return [TextContent(type="text", text=json.dumps(payload))]
+                finally:
+                    upload_sessions.release_analysis_session(args.session_id, upload_runtime_config.session_ttl_seconds)
+
+            if name == "get_async_windbg_command_result":
+                args = GetAsyncWindbgCommandResultParams(**arguments)
+                analysis, metadata, error_message = upload_sessions.acquire_analysis_session(
+                    args.session_id, upload_runtime_config.session_ttl_seconds
+                )
+                if analysis is None or metadata is None:
+                    raise McpError(
+                        ErrorData(code=INVALID_PARAMS, message=f"{UPLOAD_ERROR_SESSION_NOT_FOUND}: {error_message}")
+                    )
+                request_id = base_context["request_id"]
+                try:
+                    session = upload_sessions.get_or_create_cdb_session(
+                        upload_sessions.build_upload_cdb_session_key(args.session_id),
+                        lambda: CDBSession(
+                            dump_path=metadata.temp_file_path,
+                            cdb_path=cdb_path,
+                            symbols_path=symbols_path or DEFAULT_SYMBOL_PATH,
+                            timeout=timeout,
+                            verbose=verbose,
+                            log_context={
+                                "request_id": base_context["request_id"],
+                                "file_id": metadata.file_id,
+                                "session_id": args.session_id,
+                            },
+                        ),
+                    )
+                    ctx = _try_get_request_context(server)
+                    request_id = str(ctx.request_id) if ctx is not None else request_id
+                    loop = asyncio.get_running_loop()
+                    cancel_event = threading.Event()
+                    with _running_lock:
+                        _running_requests[request_id] = cancel_event
+
+                    def on_output(line: str) -> None:
+                        if ctx is None:
+                            return
+                        fut = asyncio.run_coroutine_threadsafe(
+                            _send_progress(ctx.session, request_id, "running", "output", f"{line}\n"),
+                            loop,
+                        )
+                        try:
+                            fut.result(timeout=5)
+                        except Exception:
+                            pass
+
+                    def on_heartbeat() -> None:
+                        if ctx is None:
+                            return
+                        fut = asyncio.run_coroutine_threadsafe(
+                            _send_progress(ctx.session, request_id, "running", "heartbeat"),
+                            loop,
+                        )
+                        try:
+                            fut.result(timeout=5)
+                        except Exception:
+                            pass
+
+                    result = await asyncio.to_thread(
+                        session.wait_for_command_result,
+                        args.command_id,
+                        float(args.wait_timeout),
+                        on_output,
+                        on_heartbeat,
+                        5.0,
+                        cancel_event,
+                    )
+                    payload = {
+                        "command_id": args.command_id,
+                        "session_id": args.session_id,
+                        "success": result["status"] == "completed",
+                        "status": result["status"],
+                        "command": result["command"],
+                        "output": "\n".join(result["output_lines"]),
+                        "output_line_count": result["output_line_count"],
+                        "execution_time_ms": result["execution_time_ms"],
+                        "queue_wait_ms": result["queue_wait_ms"],
+                        "cancelled": bool(result["cancelled"]),
+                        "timed_out": bool(result["timed_out"]),
+                        "first_output_delay_ms": result["first_output_delay_ms"],
+                        "completed": result["completed"],
                     }
                     suggested_next_step = _build_suggested_next_step(result)
                     if suggested_next_step:

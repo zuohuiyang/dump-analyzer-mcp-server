@@ -490,16 +490,25 @@ def release_analysis_session(session_id: str, ttl_seconds: int) -> None:
 
 def close_analysis_session(session_id: str) -> Tuple[Optional[Dict[str, object]], str, str]:
     with session_registry.lock:
-        analysis = session_registry.analysis_sessions.pop(session_id, None)
+        analysis = session_registry.analysis_sessions.get(session_id)
         if analysis is None:
             logger.warning(
                 "Analysis session close requested for unknown session",
                 extra=make_context(event="analysis.session.close", outcome="missing", session_id=session_id),
             )
             return None, "not_found", "Analysis session not found"
+        session_key = build_upload_cdb_session_key(session_id)
+        cdb = session_registry.cdb_sessions.get(session_key)
+        if cdb and callable(getattr(cdb, "has_pending_command", None)) and cdb.has_pending_command():
+            logger.warning(
+                "Analysis session close rejected because a command is still running",
+                extra=make_context(event="analysis.session.close", outcome="busy", file_id=analysis.file_id, session_id=session_id),
+            )
+            return None, "busy", "Analysis session still has a running or queued command"
+        analysis = session_registry.analysis_sessions.pop(session_id, None)
         upload = session_registry.upload_sessions.pop(analysis.file_id, None)
-        cdb = session_registry.cdb_sessions.pop(build_upload_cdb_session_key(session_id), None)
-        session_registry.cdb_creation_locks.pop(build_upload_cdb_session_key(session_id), None)
+        cdb = session_registry.cdb_sessions.pop(session_key, None)
+        session_registry.cdb_creation_locks.pop(session_key, None)
 
     if cdb and callable(getattr(cdb, "shutdown", None)):
         try:

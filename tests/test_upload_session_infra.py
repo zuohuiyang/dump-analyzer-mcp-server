@@ -23,6 +23,9 @@ def test_crashdump_server_exposes_only_new_design_tools():
         "prepare_dump_upload",
         "start_analysis_session",
         "execute_windbg_command",
+        "start_async_windbg_command",
+        "get_async_windbg_command_status",
+        "get_async_windbg_command_result",
         "close_analysis_session",
     }
 
@@ -36,9 +39,12 @@ def test_new_tool_schemas_match_expected_params():
     assert "session_id" in tool_map["execute_windbg_command"].inputSchema["properties"]
     assert "command" in tool_map["execute_windbg_command"].inputSchema["properties"]
     assert "timeout" in tool_map["execute_windbg_command"].inputSchema["properties"]
+    assert "command_id" in tool_map["get_async_windbg_command_status"].inputSchema["properties"]
+    assert "wait_timeout" in tool_map["get_async_windbg_command_result"].inputSchema["properties"]
 
 
 def test_tool_descriptions_include_non_streaming_guidance():
     tool_map = _get_tool_map()
     assert "sym_noisy" in tool_map["start_analysis_session"].description
     assert ".lastevent" in tool_map["execute_windbg_command"].description
+    assert ".reload /f" in tool_map["start_async_windbg_command"].description

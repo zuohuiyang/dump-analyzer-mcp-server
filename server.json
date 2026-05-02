@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.zuohuiyang/dump-analyzer-mcp-server",
   "title": "Dump Analyzer MCP Server",
-  "description": "A Model Context Protocol server for remote Windows crash dump analysis using WinDbg/CDB, with streamable-http progress plus structured final results for hosts that do not show SSE output",
+  "description": "A Model Context Protocol server for remote Windows crash dump analysis using WinDbg/CDB, with streamable-http progress, synchronous light commands, and explicit async command tools for symbol-heavy workflows",
   "repository": {
     "url": "https://github.com/zuohuiyang/dump-analyzer-mcp-server",
     "source": "github"

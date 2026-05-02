@@ -1,7 +1,6 @@
 import logging
 import os
 import queue
-import signal
 import subprocess
 import threading
 import time
@@ -14,43 +13,36 @@ logger = logging.getLogger(__name__)
 
 COMMAND_MARKER_TEXT = "COMMAND_COMPLETED_MARKER"
 COMMAND_MARKER = f".echo {COMMAND_MARKER_TEXT}"
-# Absolute upper bound to avoid unbounded command execution even if callers set a huge timeout.
-# Keep this generous: some symbol-heavy `.reload /f` runs can legitimately take a long time.
 MAX_COMMAND_WALL_TIME_HARD_LIMIT_SECONDS = 6 * 60 * 60
 
-# Default paths where cdb.exe might be located
 DEFAULT_CDB_PATHS = [
-    # Traditional Windows SDK locations
     r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe",
     r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\cdb.exe",
     r"C:\Program Files\Debugging Tools for Windows (x64)\cdb.exe",
     r"C:\Program Files\Debugging Tools for Windows (x86)\cdb.exe",
-
-    # Microsoft Store WinDbg Preview locations (architecture-specific)
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbX64.exe"),
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbX86.exe"),
-    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbARM64.exe")
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\cdbARM64.exe"),
 ]
 
-class CDBError(Exception):
 
-    """Custom exception for CDB-related errors"""
+class CDBError(Exception):
+    """Custom exception for CDB-related errors."""
 
 
 @dataclass
-class CommandExecution:
-    request_id: str
+class CommandJob:
+    job_id: str
     command: str
-    started_at: float
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
     first_output_at: Optional[float] = None
     last_output_at: Optional[float] = None
-    completed: bool = False
-    cancelled: bool = False
-    timed_out: bool = False
-    status: str = "completed"
+    status: str = "queued"
     output_lines: list[str] = field(default_factory=list)
-    done_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    line_queue: queue.Queue[str] = field(default_factory=queue.Queue, repr=False)
+    error_message: Optional[str] = None
+    completed_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 class CDBSession:
@@ -63,21 +55,6 @@ class CDBSession:
         verbose: bool = False,
         log_context: Optional[dict[str, str]] = None,
     ):
-        """
-        Initialize a dump-backed CDB debugging session.
-
-        Args:
-            dump_path: Path to the crash dump file
-            cdb_path: Custom path to cdb.exe. If None, will try to find it automatically
-            symbols_path: Custom symbols path. If None, uses default Windows symbols
-            timeout: Timeout in seconds for waiting for CDB responses
-            verbose: Whether to print additional debug information
-
-        Raises:
-            CDBError: If cdb.exe cannot be found or started
-            FileNotFoundError: If the dump file cannot be found
-            ValueError: If invalid parameters are provided
-        """
         if not dump_path:
             raise ValueError("dump_path is required")
         if not os.path.isfile(dump_path):
@@ -94,8 +71,14 @@ class CDBSession:
             file_id=self.log_context.get("file_id"),
             session_id=self.log_context.get("session_id"),
         )
+        self._state_lock = threading.Lock()
+        self._request_counter = 0
+        self._symbol_diagnostics_enabled = False
+        self._active_job: Optional[CommandJob] = None
+        self._jobs: dict[str, CommandJob] = {}
+        self._job_queue: queue.Queue[CommandJob] = queue.Queue()
+        self._shutdown_event = threading.Event()
 
-        # Find cdb executable
         self.cdb_path = self._find_cdb_executable(cdb_path)
         if not self.cdb_path:
             self.logger.error(
@@ -104,20 +87,11 @@ class CDBSession:
             )
             raise CDBError("Could not find cdb.exe. Please provide a valid path.")
 
-        # Prepare command args
-        cmd_args = [self.cdb_path]
-        cmd_args.extend(["-z", self.dump_path])
-
-        # Add symbols path if provided
+        cmd_args = [self.cdb_path, "-z", self.dump_path]
         if symbols_path:
             cmd_args.extend(["-y", symbols_path])
 
         try:
-            # Create a process group so CTRL+BREAK can be delivered for cancellation.
-            creationflags = 0
-            if os.name == 'nt':
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
             self.process = subprocess.Popen(
                 cmd_args,
                 stdin=subprocess.PIPE,
@@ -125,15 +99,14 @@ class CDBSession:
                 stderr=subprocess.STDOUT,
                 text=False,
                 bufsize=0,
-                creationflags=creationflags,
             )
-        except Exception as e:
+        except Exception as exc:
             self.logger.exception(
                 "Failed to start CDB process: %s",
-                sanitize_exception_message(str(e)),
+                sanitize_exception_message(str(exc)),
                 extra=make_context(outcome="error"),
             )
-            raise CDBError(f"Failed to start CDB process: {str(e)}")
+            raise CDBError(f"Failed to start CDB process: {exc}")
 
         self.logger.info(
             "Started CDB process for dump=%s cdb=%s symbols=%s",
@@ -143,18 +116,11 @@ class CDBSession:
             extra=make_context(outcome="started"),
         )
 
-        self.command_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._active_execution: Optional[CommandExecution] = None
-        self._request_counter = 0
-        self._symbol_diagnostics_enabled = False
         self._reader_thread = threading.Thread(target=self._read_output_bytes, daemon=True)
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._reader_thread.start()
+        self._worker_thread.start()
 
-        # Avoid blocking startup on an initialization probe command.
-        # For symbol-heavy dumps this phase can be very slow and opaque to clients.
-        # We only verify the process did not exit immediately; readiness is handled
-        # by the first real command where progress/heartbeat can be surfaced.
         time.sleep(0.2)
         if self.process.poll() is not None:
             self.shutdown()
@@ -180,14 +146,11 @@ class CDBSession:
         return current
 
     def _find_cdb_executable(self, custom_path: Optional[str] = None) -> Optional[str]:
-        """Find the cdb.exe executable"""
         if custom_path and os.path.isfile(custom_path):
             return custom_path
-
         for path in DEFAULT_CDB_PATHS:
             if os.path.isfile(path):
                 return path
-
         return None
 
     def _next_request_id(self) -> str:
@@ -195,79 +158,96 @@ class CDBSession:
             self._request_counter += 1
             return str(self._request_counter)
 
-    def _build_command_result(self, execution: CommandExecution) -> dict:
+    def _get_job(self, job_id: str) -> CommandJob:
+        with self._state_lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            raise CDBError(f"Unknown command job: {job_id}")
+        return job
+
+    def _build_job_result(
+        self,
+        job: CommandJob,
+        *,
+        now: Optional[float] = None,
+        override_status: Optional[str] = None,
+        timed_out: bool = False,
+        cancelled: bool = False,
+    ) -> dict:
+        current = now if now is not None else time.time()
+        status = override_status or job.status
+        queue_wait_ms = None
+        if job.started_at is not None:
+            queue_wait_ms = int((job.started_at - job.created_at) * 1000)
+        elif current >= job.created_at:
+            queue_wait_ms = int((current - job.created_at) * 1000)
+
         first_output_delay_ms = None
-        if execution.first_output_at is not None:
-            first_output_delay_ms = int((execution.first_output_at - execution.started_at) * 1000)
+        if job.started_at is not None and job.first_output_at is not None:
+            first_output_delay_ms = int((job.first_output_at - job.started_at) * 1000)
+
+        execution_time_ms = 0
+        if job.started_at is not None:
+            end_time = job.completed_at if job.completed_at is not None else current
+            execution_time_ms = int((end_time - job.started_at) * 1000)
+
         return {
-            "request_id": execution.request_id,
-            "command": execution.command,
-            "output_lines": execution.output_lines.copy(),
-            "cancelled": execution.cancelled,
-            "timed_out": execution.timed_out,
-            "status": execution.status,
+            "request_id": job.job_id,
+            "command": job.command,
+            "output_lines": job.output_lines.copy(),
+            "output_line_count": len(job.output_lines),
+            "cancelled": cancelled,
+            "timed_out": timed_out,
+            "status": status,
             "first_output_delay_ms": first_output_delay_ms,
-            "execution_time_ms": int((time.time() - execution.started_at) * 1000),
+            "queue_wait_ms": queue_wait_ms,
+            "execution_time_ms": execution_time_ms,
+            "started": job.started_at is not None,
+            "completed": job.completed_event.is_set(),
+            "background_running": not job.completed_event.is_set(),
+            "error_message": job.error_message,
         }
 
-    def ensure_symbol_diagnostics(self, timeout: Optional[int] = None) -> dict:
+    def _submit_job(self, command: str) -> CommandJob:
+        if not self.process or not self.process.stdin:
+            raise CDBError("CDB process is not running")
+        job = CommandJob(job_id=self._next_request_id(), command=command, created_at=time.time())
         with self._state_lock:
-            if getattr(self, "_symbol_diagnostics_enabled", False):
-                return {
-                    "request_id": "0",
-                    "command": "!sym noisy",
-                    "output_lines": [],
-                    "cancelled": False,
-                    "timed_out": False,
-                    "status": "completed",
-                    "first_output_delay_ms": None,
-                    "execution_time_ms": 0,
-                }
-
-        result = self.execute_command("!sym noisy", timeout=timeout)
-        if result["status"] != "completed":
-            raise CDBError("Failed to enable symbol diagnostics")
-
-        with self._state_lock:
-            self._symbol_diagnostics_enabled = True
-        return result
+            self._jobs[job.job_id] = job
+        self._job_queue.put(job)
+        return job
 
     def _emit_line(self, text: str) -> None:
         with self._state_lock:
-            execution = self._active_execution
-            if execution is None:
+            job = self._active_job
+            if job is None:
                 return
-
             if COMMAND_MARKER_TEXT in text:
-                execution.completed = True
-                execution.done_event.set()
+                if job.status in {"queued", "running"}:
+                    job.status = "completed"
+                job.completed_at = time.time()
+                job.completed_event.set()
                 return
-
             now = time.time()
-            if execution.first_output_at is None:
-                execution.first_output_at = now
-            execution.last_output_at = now
-            execution.output_lines.append(text)
-            execution.line_queue.put(text)
+            if job.first_output_at is None:
+                job.first_output_at = now
+            job.last_output_at = now
+            job.output_lines.append(text)
 
     def _read_output_bytes(self) -> None:
-        """Thread function to continuously read raw CDB output bytes."""
         if not self.process or not self.process.stdout:
             return
-
         buffer = bytearray()
         skip_next_lf = False
         try:
-            while True:
+            while not self._shutdown_event.is_set():
                 chunk = self.process.stdout.read(1)
                 if not chunk:
                     break
-
                 if skip_next_lf and chunk == b"\n":
                     skip_next_lf = False
                     continue
                 skip_next_lf = False
-
                 if chunk in (b"\r", b"\n"):
                     if chunk == b"\r":
                         skip_next_lf = True
@@ -281,44 +261,193 @@ class CDBSession:
                         )
                     self._emit_line(line)
                     continue
-
                 buffer.extend(chunk)
-        except (IOError, ValueError) as e:
+        except (IOError, ValueError) as exc:
             if self.verbose:
                 self.logger.warning(
                     "CDB output reader error: %s",
-                    sanitize_exception_message(str(e)),
+                    sanitize_exception_message(str(exc)),
                     extra=make_context(event="cdb.output", outcome="error"),
                 )
         finally:
             if buffer:
-                line = buffer.decode("utf-8", errors="replace")
-                if self.verbose:
-                    self.logger.debug(
-                        "CDB output preview: %s",
-                        sanitize_output_text(line),
-                        extra=make_context(event="cdb.output", outcome="streaming"),
-                    )
-                self._emit_line(line)
+                self._emit_line(buffer.decode("utf-8", errors="replace"))
+
+    def _finalize_active_job(self, *, status: str, error_message: Optional[str] = None) -> None:
+        with self._state_lock:
+            job = self._active_job
+            if job is None:
+                return
+            job.status = status
+            job.error_message = error_message
+            job.completed_at = time.time()
+            job.completed_event.set()
+
+    def _worker_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                job = self._job_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._shutdown_event.is_set():
+                break
+
+            session_logger = self._ensure_logger()
+            command_preview = sanitize_command(job.command)
+            with self._state_lock:
+                self._active_job = job
+                job.started_at = time.time()
+                job.status = "running"
+
+            session_logger.info(
+                "Executing CDB command",
+                extra=make_context(
+                    event="cdb.command",
+                    outcome="started",
+                    request_id=job.job_id,
+                    command_preview=command_preview,
+                ),
+            )
+
+            try:
+                self.process.stdin.write(f"{job.command}\n{COMMAND_MARKER}\n".encode("utf-8"))
+                self.process.stdin.flush()
+            except IOError as exc:
+                session_logger.exception(
+                    "Failed to send command to CDB: %s",
+                    sanitize_exception_message(str(exc)),
+                    extra=make_context(
+                        event="cdb.command",
+                        outcome="error",
+                        request_id=job.job_id,
+                        command_preview=command_preview,
+                    ),
+                )
+                self._finalize_active_job(status="failed", error_message=f"Failed to send command: {exc}")
+            else:
+                deadline = time.time() + MAX_COMMAND_WALL_TIME_HARD_LIMIT_SECONDS
+                while not self._shutdown_event.is_set() and not job.completed_event.wait(timeout=0.2):
+                    if self.process and self.process.poll() is not None:
+                        self._finalize_active_job(status="failed", error_message="CDB process exited during command execution")
+                        break
+                    if time.time() > deadline:
+                        self._finalize_active_job(
+                            status="failed",
+                            error_message=f"Command exceeded max wall time after {MAX_COMMAND_WALL_TIME_HARD_LIMIT_SECONDS} seconds: {job.command}",
+                        )
+                        break
+                if job.completed_event.is_set() and job.command.strip().lower() == "!sym noisy" and job.status == "completed":
+                    with self._state_lock:
+                        self._symbol_diagnostics_enabled = True
+
+            session_logger.info(
+                "CDB command finished with status=%s in %sms with %s output lines",
+                job.status,
+                self._build_job_result(job)["execution_time_ms"],
+                len(job.output_lines),
+                extra=make_context(
+                    event="cdb.command",
+                    outcome="success" if job.status == "completed" else job.status,
+                    request_id=job.job_id,
+                    command_preview=command_preview,
+                ),
+            )
+
+            with self._state_lock:
+                self._active_job = None
+
+    def has_pending_command(self) -> bool:
+        with self._state_lock:
+            if self._active_job and not self._active_job.completed_event.is_set():
+                return True
+            return any(not job.completed_event.is_set() for job in self._jobs.values())
+
+    def get_pending_command(self) -> Optional[dict]:
+        with self._state_lock:
+            if self._active_job and not self._active_job.completed_event.is_set():
+                return self._build_job_result(self._active_job)
+            for job in self._jobs.values():
+                if not job.completed_event.is_set():
+                    return self._build_job_result(job)
+        return None
+
+    def start_async_command(self, command: str) -> dict:
+        job = self._submit_job(command)
+        return self._build_job_result(job)
+
+    def get_command_status(self, job_id: str) -> dict:
+        return self._build_job_result(self._get_job(job_id))
+
+    def wait_for_command_result(
+        self,
+        job_id: str,
+        wait_timeout: float = 0,
+        on_output: Optional[Callable[[str], None]] = None,
+        on_heartbeat: Optional[Callable[[], None]] = None,
+        heartbeat_interval: float = 5.0,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> dict:
+        job = self._get_job(job_id)
+        wait_started_at = time.time()
+        last_heartbeat_at = wait_started_at
+        next_output_index = 0
+
+        while True:
+            with self._state_lock:
+                new_lines = job.output_lines[next_output_index:]
+                completed = job.completed_event.is_set()
+            for line in new_lines:
+                if on_output:
+                    on_output(line)
+            next_output_index += len(new_lines)
+
+            if completed:
+                result = self._build_job_result(job)
+                if result["status"] == "failed" and job.error_message:
+                    raise CDBError(job.error_message)
+                return result
+
+            if cancel_event and cancel_event.is_set():
+                return self._build_job_result(job, override_status="cancelled", cancelled=True)
+
+            if wait_timeout > 0 and (time.time() - wait_started_at) >= wait_timeout:
+                return self._build_job_result(job, override_status="timeout", timed_out=True)
+
+            if on_heartbeat and heartbeat_interval > 0 and (time.time() - last_heartbeat_at) >= heartbeat_interval:
+                on_heartbeat()
+                last_heartbeat_at = time.time()
+
+            time.sleep(0.2)
+
+    def ensure_symbol_diagnostics(self, timeout: Optional[int] = None) -> dict:
+        with self._state_lock:
+            if self._symbol_diagnostics_enabled:
+                return {
+                    "request_id": "0",
+                    "command": "!sym noisy",
+                    "output_lines": [],
+                    "output_line_count": 0,
+                    "cancelled": False,
+                    "timed_out": False,
+                    "status": "completed",
+                    "first_output_delay_ms": None,
+                    "queue_wait_ms": 0,
+                    "execution_time_ms": 0,
+                    "started": True,
+                    "completed": True,
+                    "background_running": False,
+                    "error_message": None,
+                }
+        result = self.execute_command("!sym noisy", timeout=timeout)
+        if result["status"] != "completed":
+            raise CDBError("Failed to enable symbol diagnostics")
+        return result
 
     def send_command(self, command: str, timeout: Optional[int] = None) -> list[str]:
-        """
-        Send a command to CDB and return the output
-
-        Args:
-            command: The command to send
-            timeout: Custom timeout for this command (overrides instance timeout)
-
-        Returns:
-            List of output lines from CDB
-
-        Raises:
-            CDBError: If the command times out or CDB is not responsive
-        """
         if not self.process:
             raise CDBError("CDB process is not running")
-        result = self.execute_command(command, timeout=timeout)
-        return result["output_lines"]
+        return self.execute_command(command, timeout=timeout)["output_lines"]
 
     def execute_command(
         self,
@@ -329,152 +458,19 @@ class CDBSession:
         heartbeat_interval: float = 5.0,
         cancel_event: Optional[threading.Event] = None,
     ) -> dict:
-        if not self.process or not self.process.stdin:
-            raise CDBError("CDB process is not running")
-
-        # `timeout` is the externally visible command timeout. Once the command has not
-        # finished within this duration, we attempt to interrupt it and return status=timeout.
-        # A separate hard wall-time cap remains as a safety net for truly stuck commands.
-        cmd_timeout = timeout or self.timeout
-        cmd_wall_timeout = MAX_COMMAND_WALL_TIME_HARD_LIMIT_SECONDS
-        request_id = self._next_request_id()
-        command_preview = sanitize_command(command)
-        execution = CommandExecution(
-            request_id=request_id,
-            command=command,
-            started_at=time.time(),
+        job = self._submit_job(command)
+        return self.wait_for_command_result(
+            job.job_id,
+            wait_timeout=float(timeout or self.timeout),
+            on_output=on_output,
+            on_heartbeat=on_heartbeat,
+            heartbeat_interval=heartbeat_interval,
+            cancel_event=cancel_event,
         )
-        last_heartbeat_at = execution.started_at
-        interrupt_deadline: Optional[float] = None
-
-        with self.command_lock:
-            session_logger = self._ensure_logger()
-            session_logger.info(
-                "Executing CDB command",
-                extra=make_context(
-                    event="cdb.command",
-                    outcome="started",
-                    request_id=request_id,
-                    command_preview=command_preview,
-                ),
-            )
-            try:
-                with self._state_lock:
-                    self._active_execution = execution
-
-                self.process.stdin.write(f"{command}\n{COMMAND_MARKER}\n".encode("utf-8"))
-                self.process.stdin.flush()
-            except IOError as e:
-                session_logger.exception(
-                    "Failed to send command to CDB: %s",
-                    sanitize_exception_message(str(e)),
-                    extra=make_context(
-                        event="cdb.command",
-                        outcome="error",
-                        request_id=request_id,
-                        command_preview=command_preview,
-                    ),
-                )
-                raise CDBError(f"Failed to send command: {str(e)}")
-
-            try:
-                while True:
-                    now = time.time()
-                    if now - execution.started_at > cmd_wall_timeout:
-                        session_logger.warning(
-                            "Command exceeded hard wall timeout",
-                            extra=make_context(
-                                event="cdb.command",
-                                outcome="timeout",
-                                request_id=request_id,
-                                command_preview=command_preview,
-                            ),
-                        )
-                        raise CDBError(
-                            f"Command exceeded max wall time after {cmd_wall_timeout} seconds: {command}"
-                        )
-                    if now - execution.started_at > cmd_timeout and not execution.cancelled and not execution.timed_out:
-                        session_logger.warning(
-                            "Command exceeded timeout before completion",
-                            extra=make_context(
-                                event="cdb.command",
-                                outcome="timeout",
-                                request_id=request_id,
-                                command_preview=command_preview,
-                            ),
-                        )
-                        execution.timed_out = True
-                        execution.status = "timeout"
-                        try:
-                            self.send_ctrl_break()
-                        except CDBError:
-                            pass
-                        interrupt_deadline = time.time() + 5.0
-
-                    if cancel_event and cancel_event.is_set() and not execution.cancelled:
-                        execution.cancelled = True
-                        execution.status = "cancelled"
-                        session_logger.info(
-                            "Cancellation requested for CDB command",
-                            extra=make_context(
-                                event="cdb.command",
-                                outcome="cancelling",
-                                request_id=request_id,
-                                command_preview=command_preview,
-                            ),
-                        )
-                        try:
-                            self.send_ctrl_break()
-                        except CDBError:
-                            # Preserve cancellation state even if signal delivery fails.
-                            pass
-                        interrupt_deadline = time.time() + 5.0
-
-                    if (
-                        execution.cancelled
-                        and interrupt_deadline is not None
-                        and time.time() > interrupt_deadline
-                        and not execution.completed
-                    ):
-                        execution.completed = True
-                        execution.done_event.set()
-
-                    try:
-                        line = execution.line_queue.get(timeout=0.2)
-                        if on_output:
-                            on_output(line)
-                    except queue.Empty:
-                        if (
-                            on_heartbeat
-                            and heartbeat_interval > 0
-                            and not execution.completed
-                            and (time.time() - last_heartbeat_at) >= heartbeat_interval
-                        ):
-                            on_heartbeat()
-                            last_heartbeat_at = time.time()
-
-                    if execution.completed and execution.line_queue.empty():
-                        break
-            finally:
-                with self._state_lock:
-                    self._active_execution = None
-
-        session_logger.info(
-            "CDB command finished in %sms with %s output lines",
-            int((time.time() - execution.started_at) * 1000),
-            len(execution.output_lines),
-            extra=make_context(
-                event="cdb.command",
-                outcome="timeout" if execution.timed_out else ("cancelled" if execution.cancelled else "success"),
-                request_id=request_id,
-                command_preview=command_preview,
-            ),
-        )
-        return self._build_command_result(execution)
 
     def shutdown(self):
-        """Clean up and terminate the CDB process"""
         session_logger = self._ensure_logger()
+        self._shutdown_event.set()
         try:
             if self.process and self.process.poll() is None:
                 try:
@@ -483,45 +479,31 @@ class CDBSession:
                     self.process.wait(timeout=1)
                 except Exception:
                     pass
-
                 if self.process.poll() is None:
                     self.process.terminate()
                     self.process.wait(timeout=3)
-        except Exception as e:
+        except Exception as exc:
             session_logger.exception(
                 "Error during CDB shutdown: %s",
-                sanitize_exception_message(str(e)),
+                sanitize_exception_message(str(exc)),
                 extra=make_context(event="cdb.session", outcome="error"),
             )
         finally:
-            self.process = None
+            with self._state_lock:
+                active_job = self._active_job
+                self.process = None
+            if active_job and not active_job.completed_event.is_set():
+                active_job.status = "failed"
+                active_job.error_message = "CDB session was shut down before the command completed"
+                active_job.completed_at = time.time()
+                active_job.completed_event.set()
             session_logger.info(
                 "CDB session shutdown completed",
                 extra=make_context(event="cdb.session", outcome="stopped"),
             )
 
-    def send_ctrl_break(self) -> None:
-        """Send a CTRL+BREAK event to the CDB process to break in.
-
-        Raises:
-            CDBError: If the signal cannot be delivered or the process is not running.
-        """
-        if not self.process or self.process.poll() is not None:
-            raise CDBError("CDB process is not running")
-
-        try:
-            self._ensure_logger().info(
-                "Sending CTRL+BREAK to CDB process",
-                extra=make_context(event="cdb.command", outcome="interrupt"),
-            )
-            self.process.send_signal(signal.CTRL_BREAK_EVENT)
-        except Exception as e:
-            raise CDBError(f"Failed to send CTRL+BREAK: {str(e)}")
-
     def __enter__(self):
-        """Support for context manager protocol"""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Clean up when exiting context manager"""
         self.shutdown()
