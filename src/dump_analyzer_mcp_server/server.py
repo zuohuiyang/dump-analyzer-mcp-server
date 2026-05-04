@@ -1,8 +1,10 @@
 import asyncio
 import atexit
 import errno
+import ipaddress
 import json
 import logging
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -458,15 +460,60 @@ async def serve_http(
         extra=make_context(event="server.start", outcome="configured"),
     )
 
-    config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        log_level="debug" if verbose else "info",
-        log_config=None,
-    )
-    server_instance = uvicorn.Server(config)
     try:
+        # Validate public_base_url before starting the server
+        parsed = urlparse(public_base_url)
+        hostname = (parsed.hostname or "").strip().lower()
+        if not parsed.scheme or not parsed.netloc or hostname in {"0.0.0.0", "::", "localhost", "127.0.0.1"}:
+            raise ValueError(
+                f"Invalid --public-base-url: '{public_base_url}'. It must be a complete URL with a routable hostname or IP (e.g., http://192.168.1.100:8000). 'localhost' or '127.0.0.1' are not allowed."
+            )
+            
+        # 严格校验 hostname 必须是合法 IP 或带点号的合法域名
+        is_valid_ip = False
+        try:
+            ipaddress.ip_address(hostname)
+            is_valid_ip = True
+        except ValueError:
+            pass
+            
+        # 简单的带后缀域名正则匹配 (e.g., example.com, api.my-domain.org)
+        domain_regex = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$")
+        is_valid_domain = bool(domain_regex.match(hostname))
+        
+        if not is_valid_ip and not is_valid_domain:
+            raise ValueError(
+                f"Invalid --public-base-url: '{public_base_url}'. The hostname '{hostname}' must be a valid IP address or a valid domain name with a suffix (e.g., example.com). Placeholders like 'your-host' are not allowed."
+            )
+
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="debug" if verbose else "info",
+            log_config=None,
+        )
+        
+        server_instance = uvicorn.Server(config)
+        
+        # 延迟一小段时间再打印配置，确保它在 uvicorn 启动日志之后输出，避免被日志打断
+        async def print_config_later():
+            await asyncio.sleep(0.5)
+            print("\n" + "=" * 50)
+            print("Dump Analyzer MCP Server is ready!")
+            print("Add the following configuration to your MCP client:")
+            print("-" * 50)
+            print(json.dumps({
+                "mcpServers": {
+                    "dump-analyzer": {
+                        "url": f"{public_base_url}/mcp"
+                    }
+                }
+            }, indent=2))
+            print("=" * 50 + "\n")
+            
+        asyncio.create_task(print_config_later())
+        
         await server_instance.serve()
     finally:
         logger.info(

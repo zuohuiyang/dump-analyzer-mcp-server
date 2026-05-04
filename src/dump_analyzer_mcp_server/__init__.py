@@ -62,7 +62,7 @@ def main():
             f"(default: {DEFAULT_LOG_MAX_TOTAL_SIZE_MB})"
         ),
     )
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind HTTP server to (default: 127.0.0.1)")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind HTTP server to (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind HTTP server to (default: 8000)")
     parser.add_argument(
         "--public-base-url",
